@@ -158,6 +158,21 @@ class VLMChatApp:
         cv2.putText(out, header, (margin, margin + line_h - 6),
                     font, scale, text_color, thickness, cv2.LINE_AA)
 
+        # Picture-in-picture inset of the captured frame (top-right).
+        if (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT)
+                and self.frozen_frame is not None):
+            inset_w = max(160, w // 4)
+            ih, iw = self.frozen_frame.shape[:2]
+            inset_h = max(1, int(round(inset_w * ih / iw)))
+            inset = cv2.resize(self.frozen_frame, (inset_w, inset_h), interpolation=cv2.INTER_AREA)
+            x0 = w - inset_w - margin
+            y0 = banner_h + margin
+            if x0 >= 0 and y0 + inset_h <= h:
+                out[y0:y0 + inset_h, x0:x0 + inset_w] = inset
+                cv2.rectangle(out, (x0 - 1, y0 - 1),
+                              (x0 + inset_w, y0 + inset_h),
+                              (255, 255, 255), 1)
+
         # Bottom panel: question / response.
         panel_lines = []
         max_text_w = w - 2 * margin
@@ -279,18 +294,16 @@ class VLMChatApp:
 
         try:
             while self.running:
-                # Acquire / pick the base frame for this iteration.
-                if self.current_state == STATE_STREAMING:
-                    raw_view, raw_inf = get_frame()
-                    if raw_view is None:
-                        logger.error("Failed to read frame from camera")
-                        break
-                    # picamera2 'RGB888' yields BGR-ordered bytes in numpy (matching cv2). USB is BGR. No conversion needed.
-                    viewfinder_frame = raw_view
-                    inference_frame = raw_inf
-                    base_frame = viewfinder_frame
-                else:
-                    base_frame = self.frozen_frame
+                # Always grab a live frame so the viewfinder stays alive in every state
+                # (PiP shows the captured frame as an inset on top of the live feed).
+                raw_view, raw_inf = get_frame()
+                if raw_view is None:
+                    logger.error("Failed to read frame from camera")
+                    break
+                # picamera2 'RGB888' yields BGR-ordered bytes in numpy (matching cv2). USB is BGR. No conversion needed.
+                viewfinder_frame = raw_view
+                inference_frame = raw_inf
+                base_frame = viewfinder_frame
 
                 # Drain any pending streamed tokens before drawing.
                 if self.current_state == STATE_PROCESSING and self.backend is not None:
