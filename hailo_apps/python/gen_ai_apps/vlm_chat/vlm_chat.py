@@ -71,6 +71,8 @@ class VLMChatApp:
         self.current_state = STATE_STREAMING
         self.user_question = ''
         self.streamed_response = ''
+        self.pip_anim_start: Optional[float] = None  # set when PiP appears, drives slide-in
+        self.pip_anim_out_start: Optional[float] = None  # set when dismissing, drives slide-out
         self.backend: Optional[Backend] = None
         self.video_thread: Optional[threading.Thread] = None
 
@@ -158,20 +160,51 @@ class VLMChatApp:
         cv2.putText(out, header, (margin, margin + line_h - 6),
                     font, scale, text_color, thickness, cv2.LINE_AA)
 
-        # Picture-in-picture inset of the captured frame (top-right).
-        if (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT)
+        # Picture-in-picture inset of the captured frame (top-right), with a
+        # slide-in + slide-out animation. `eased` is a 0..1 visibility factor
+        # (0 = off-screen right, 1 = settled at final position).
+        anim_duration = 0.35
+        eased = None
+        if self.pip_anim_out_start is not None and self.frozen_frame is not None:
+            elapsed = time.time() - self.pip_anim_out_start
+            t = max(0.0, min(1.0, 1.0 - elapsed / anim_duration))
+            eased = t * t * t  # ease-in cubic (fast at first, slows toward gone)
+        elif (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT)
                 and self.frozen_frame is not None):
+            elapsed = (time.time() - self.pip_anim_start) if self.pip_anim_start is not None else anim_duration
+            t = max(0.0, min(1.0, elapsed / anim_duration))
+            eased = 1.0 - (1.0 - t) ** 3  # ease-out cubic
+
+        if eased is not None and eased > 0.0:
             inset_w = max(160, w // 4)
             ih, iw = self.frozen_frame.shape[:2]
             inset_h = max(1, int(round(inset_w * ih / iw)))
             inset = cv2.resize(self.frozen_frame, (inset_w, inset_h), interpolation=cv2.INTER_AREA)
-            x0 = w - inset_w - margin
-            y0 = banner_h + margin
-            if x0 >= 0 and y0 + inset_h <= h:
-                out[y0:y0 + inset_h, x0:x0 + inset_w] = inset
-                cv2.rectangle(out, (x0 - 1, y0 - 1),
+            final_x = w - inset_w - margin
+            final_y = banner_h + margin
+            start_x = w + 4  # just off-screen right
+            x0 = int(round(start_x + (final_x - start_x) * eased))
+            y0 = final_y
+            alpha = eased
+
+            x_clip0, x_clip1 = max(0, x0), min(w, x0 + inset_w)
+            y_clip0, y_clip1 = max(0, y0), min(h, y0 + inset_h)
+            if x_clip1 > x_clip0 and y_clip1 > y_clip0:
+                src_x0 = x_clip0 - x0
+                src_x1 = src_x0 + (x_clip1 - x_clip0)
+                src_y0 = y_clip0 - y0
+                src_y1 = src_y0 + (y_clip1 - y_clip0)
+                inset_clip = inset[src_y0:src_y1, src_x0:src_x1]
+                roi = out[y_clip0:y_clip1, x_clip0:x_clip1]
+                if alpha >= 1.0:
+                    roi[...] = inset_clip
+                else:
+                    cv2.addWeighted(inset_clip, alpha, roi, 1.0 - alpha, 0.0, dst=roi)
+                border_intensity = int(255 * alpha)
+                cv2.rectangle(out,
+                              (x0 - 1, y0 - 1),
                               (x0 + inset_w, y0 + inset_h),
-                              (255, 255, 255), 1)
+                              (border_intensity, border_intensity, border_intensity), 1)
 
         # Bottom panel: question / response.
         panel_lines = []
@@ -200,12 +233,19 @@ class VLMChatApp:
 
         return out
 
-    def _reset_session(self) -> None:
-        """Clear all per-question state."""
+    def _dismiss_pip(self) -> None:
+        """Start the PiP slide-out animation; cleanup happens once it finishes."""
+        if self.frozen_frame is not None and self.pip_anim_out_start is None:
+            self.pip_anim_out_start = time.time()
+
+    def _clear_pip(self) -> None:
+        """Hard-reset all PiP / per-question state. Called after slide-out completes."""
         self.frozen_frame = None
         self.frozen_inference_frame = None
         self.user_question = ''
         self.streamed_response = ''
+        self.pip_anim_start = None
+        self.pip_anim_out_start = None
 
     def _init_camera(self) -> tuple[Callable[[], Any], Callable[[], None], str]:
         """
@@ -317,6 +357,11 @@ class VLMChatApp:
                 key = -1 if key == -1 else key & 0xFFFF
                 self._handle_key(key, viewfinder_frame, inference_frame)
 
+                # Once the slide-out animation has finished, drop the PiP state.
+                if (self.pip_anim_out_start is not None
+                        and time.time() - self.pip_anim_out_start >= 0.35):
+                    self._clear_pip()
+
                 if not self.running:
                     break
 
@@ -373,12 +418,14 @@ class VLMChatApp:
                     self.frozen_inference_frame = inference_frame.copy()
                     self.user_question = ''
                     self.streamed_response = ''
+                    self.pip_anim_start = time.time()
+                    self.pip_anim_out_start = None  # cancel any in-progress slide-out
                     self.current_state = STATE_CAPTURED
             return
 
         if self.current_state == STATE_CAPTURED:
             if key == ESC:
-                self._reset_session()
+                self._dismiss_pip()
                 self.current_state = STATE_STREAMING
                 return
             if key in ENTER:
@@ -407,7 +454,7 @@ class VLMChatApp:
                 self.stop()
                 return
             if key in ENTER:
-                self._reset_session()
+                self._dismiss_pip()
                 self.current_state = STATE_STREAMING
 
     def run(self):
