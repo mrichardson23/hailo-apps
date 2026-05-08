@@ -206,8 +206,8 @@ class VLMChatApp:
                 picam2 = Picamera2()
                 # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference
                 config = picam2.create_preview_configuration(
-                    main={"size": (1280, 720), "format": "RGB888"},
-                    lores={"size": (640, 480), "format": "RGB888"},
+                    main={"size": (1920, 1080), "format": "RGB888"},
+                    lores={"size": (448, 448), "format": "RGB888"},
                     raw={"size": (2304, 1296)},
                 )
                 picam2.configure(config)
@@ -254,8 +254,9 @@ class VLMChatApp:
             self.running = False
             return
 
-        # Create the display window without the Qt toolbar/status bar
-        cv2.namedWindow('Video', cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+        # Full-screen window without the Qt toolbar/status bar.
+        cv2.namedWindow('Video', cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+        cv2.setWindowProperty('Video', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         # Initialize Backend
         try:
