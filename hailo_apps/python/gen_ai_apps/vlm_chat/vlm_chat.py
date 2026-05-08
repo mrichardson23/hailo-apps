@@ -5,6 +5,7 @@ import cv2
 import sys
 import concurrent.futures
 import time
+import numpy as np
 from typing import Optional, Callable, Any
 from pathlib import Path
 
@@ -46,7 +47,7 @@ STATE_EVENT = "EVENT"
 
 # Monitor mode defaults.
 MONITOR_INTERVAL_DEFAULT = 1.0   # min seconds between successive captures
-MONITOR_COOLDOWN_DEFAULT = 30.0  # min seconds between fired events
+MONITOR_COOLDOWN_DEFAULT = 10.0  # min seconds between fired events
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -147,6 +148,21 @@ class VLMChatApp:
         if self.backend:
             self.backend.close()
         self.executor.shutdown(wait=True)
+
+    @staticmethod
+    def _show_splash(text: str) -> None:
+        """Render a fullscreen splash frame so the user has feedback during init."""
+        # cv2 uses BGR; user requested RGB(205, 35, 85) → BGR(85, 35, 205).
+        frame = np.full((1080, 1920, 3), (85, 35, 205), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 1.5
+        thickness = 2
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+        x = (frame.shape[1] - tw) // 2
+        y = (frame.shape[0] + th) // 2
+        cv2.putText(frame, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.imshow('Video', frame)
+        cv2.waitKey(1)  # let X actually paint the frame
 
     def _init_voice_stack(self) -> None:
         """Best-effort init of STT/TTS components. Failure disables the feature, not the app."""
@@ -442,9 +458,9 @@ class VLMChatApp:
             else:
                 header = "Type sentence  |  Enter: arm   Esc: cancel"
         elif self.current_state == STATE_MONITORING:
-            header = f"Monitoring: {self.trigger_text}  |  t: change   Esc: stop"
+            header = f"Monitoring: {self.trigger_text}  |  T: change   Esc: stop"
         elif self.current_state == STATE_EVENT:
-            header = "EVENT  |  Enter / t: resume monitoring   Esc: stop"
+            header = "EVENT  |  Enter : resume monitoring   T: change   Esc: stop"
         else:
             header = ""
 
@@ -603,6 +619,12 @@ class VLMChatApp:
 
     def show_video(self):
         """Main loop: render video + overlay and handle keystrokes from the cv2 window."""
+        # Open the full-screen window first so we can show progress while the
+        # camera, VLM backend and voice stack are loading (init can take ~5s).
+        cv2.namedWindow('Video', cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
+        cv2.setWindowProperty('Video', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        self._show_splash("Initialising...")
+
         try:
             get_frame, cleanup, _ = self._init_camera()
         except Exception:
@@ -610,11 +632,8 @@ class VLMChatApp:
             self.running = False
             return
 
-        # Full-screen window without the Qt toolbar/status bar.
-        cv2.namedWindow('Video', cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_NORMAL)
-        cv2.setWindowProperty('Video', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-
         # Initialize Backend
+        self._show_splash("Loading VLM...")
         try:
             self.backend = Backend(
                 hef_path=str(hef_path),
@@ -630,6 +649,7 @@ class VLMChatApp:
             return
 
         # Best-effort init of speech I/O. Failures degrade gracefully.
+        self._show_splash("Loading speech models...")
         self._init_voice_stack()
 
         vlm_future = None
@@ -957,7 +977,7 @@ if __name__ == "__main__":
     parser.add_argument('--monitor-interval', type=float, default=MONITOR_INTERVAL_DEFAULT,
                         help='Min seconds between successive captures in monitor mode (default 1.0).')
     parser.add_argument('--monitor-cooldown', type=float, default=MONITOR_COOLDOWN_DEFAULT,
-                        help='Min seconds between fired events in monitor mode (default 30.0).')
+                        help='Min seconds between fired events in monitor mode (default 10.0).')
 
     # Handle --list-models flag before full initialization
     handle_list_models_flag(parser, VLM_CHAT_APP)
