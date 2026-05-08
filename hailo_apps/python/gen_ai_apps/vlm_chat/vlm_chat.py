@@ -53,6 +53,16 @@ MONITOR_COOLDOWN_DEFAULT = 10.0  # min seconds between fired events
 # derived default; 2.0 is twice as blurry, 0.5 half.
 BLUR_STRENGTH = 0.4
 
+# Pre-canned questions selectable via 1-5 from the Tab-triggered presets
+# panel in STATE_STREAMING.
+PRESET_QUESTIONS = [
+    "Describe the scene",
+    "List every object you can see",
+    "What is the setting / location?",
+    "Estimate how many people are visible",
+    "What time of day does this look like?",
+]
+
 # Initialize logger
 logger = get_logger(__name__)
 
@@ -116,6 +126,9 @@ class VLMChatApp:
 
         # Whether to blur the left/right strips outside the central VLM crop.
         self.blur_fov = blur_fov
+
+        # Tab toggles a presets panel listing F1-F5 → pre-canned questions.
+        self.show_presets = False
 
     def signal_handler(self, sig, frame):
         """Handle interrupt signals."""
@@ -262,6 +275,25 @@ class VLMChatApp:
             except Exception as e:
                 logger.debug(f"Error aborting recorder: {e}")
             self.is_recording = False
+
+    def _submit_preset(self, idx: int, viewfinder_frame, inference_frame) -> None:
+        """Run a pre-canned question against the current frame, skipping STATE_CAPTURED."""
+        self.frozen_frame = viewfinder_frame.copy()
+        self.frozen_inference_frame = inference_frame.copy()
+        self.user_question = PRESET_QUESTIONS[idx]
+        self.streamed_response = ''
+        self.has_typed = False
+        self._active_text_target = 'user_question'
+        self.pip_anim_start = time.time()
+        self.pip_anim_out_start = None
+        self.show_presets = False
+        if SAVE_FRAMES:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            cv2.imwrite(f"frame_{timestamp}.jpg", self.frozen_inference_frame)
+        if self.backend is not None:
+            self.backend.clear_stream()
+        self._tts_begin()
+        self.current_state = STATE_PROCESSING
 
     def _tts_begin(self) -> None:
         if self.tts is None:
@@ -544,7 +576,7 @@ class VLMChatApp:
 
         # Top banner: state header.
         if self.current_state == STATE_STREAMING:
-            header = "LIVE  |  Enter: capture   T: trigger   R: reset   Q/Esc: quit"
+            header = "LIVE  |  Enter: capture   Tab: presets   T: trigger   R: reset   Q/Esc: quit"
         elif self.current_state == STATE_CAPTURED:
             if self.is_recording:
                 header = "Recording...  |  Space: stop"
@@ -578,6 +610,16 @@ class VLMChatApp:
         self._draw_translucent_box(out, 0, 0, w, banner_h, alpha=0.55, tint=box_tint)
         cv2.putText(out, header, (margin, margin + line_h - 6),
                     font, scale, text_color, thickness, cv2.LINE_AA)
+
+        # Presets panel: shown immediately below the banner while in STREAMING
+        # with the toggle on. Each row pairs an F-key with its preset question.
+        if self.current_state == STATE_STREAMING and self.show_presets:
+            panel_h = line_h * len(PRESET_QUESTIONS) + 2 * margin
+            self._draw_translucent_box(out, 0, banner_h, w, panel_h, alpha=0.55)
+            for i, question in enumerate(PRESET_QUESTIONS):
+                y = banner_h + margin + (i + 1) * line_h - 6
+                cv2.putText(out, f"{i + 1}  {question}", (margin, y),
+                            font, scale, text_color, thickness, cv2.LINE_AA)
 
         # Picture-in-picture inset of the captured frame (top-right), with a
         # zoom-in / zoom-out animation. `s` is a 0..1 shrink factor:
@@ -926,6 +968,15 @@ class VLMChatApp:
         if self.current_state == STATE_STREAMING:
             if key == ESC or key in (ord('q'), ord('Q')):
                 self.stop()
+                return
+            TAB = 9
+            if key == TAB:
+                self.show_presets = not self.show_presets
+                return
+            if self.show_presets and ord('1') <= key <= ord('5'):
+                idx = key - ord('1')
+                if viewfinder_frame is not None and inference_frame is not None:
+                    self._submit_preset(idx, viewfinder_frame, inference_frame)
                 return
             if key in (ord('t'), ord('T')):
                 # Enter trigger-setup mode for the event monitor.
