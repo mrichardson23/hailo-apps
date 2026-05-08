@@ -296,13 +296,26 @@ class VLMChatApp:
     def _tts_interrupt(self) -> None:
         if self.tts is None:
             return
-        try:
-            self.tts.interrupt()
-        except Exception as e:
-            logger.debug(f"Error interrupting TTS: {e}")
+        # The TTS worker holds an internal lock while audio is playing
+        # (`audio_player.play(block=True)` inside a `with self._speech_lock`).
+        # Calling tts.interrupt() from the main thread acquires the same
+        # lock, so a synchronous call would freeze the cv2 loop for the
+        # duration of any in-flight playback. Submit the interrupt to the
+        # executor so the lock contention happens off the UI thread.
+        tts = self.tts
+        self.executor.submit(self._safe_tts_interrupt, tts)
+        # Local state mutations are cheap and must happen synchronously
+        # so subsequent _tts_begin/_tts_feed calls see a clean slate.
         self.tts_buffer = ''
         self.tts_gen_id = None
         self.tts_first_chunk = True
+
+    @staticmethod
+    def _safe_tts_interrupt(tts) -> None:
+        try:
+            tts.interrupt()
+        except Exception as e:
+            logger.debug(f"Error interrupting TTS (off-thread): {e}")
 
     @staticmethod
     def _build_monitor_prompt(trigger: str) -> str:
@@ -394,6 +407,14 @@ class VLMChatApp:
                 system_prompt=SYSTEM_PROMPT,
             )
             logger.info("VLM backend reloaded.")
+            # Warm up the freshly-loaded HEF so the next user inference is fast.
+            self._show_splash("Warming up VLM...")
+            try:
+                dummy = np.zeros((448, 448, 3), dtype=np.uint8)
+                self.backend.vlm_inference(dummy, "ok", INFERENCE_TIMEOUT)
+                self.backend.poll_stream()
+            except Exception as e:
+                logger.debug(f"Post-reset warm-up failed (non-fatal): {e}")
         except Exception as e:
             logger.error(f"Failed to reload VLM backend: {e}")
             self.running = False
@@ -696,9 +717,22 @@ class VLMChatApp:
             self.running = False
             return
 
+        # Warm up the VLM with a dummy frame so the first user-facing
+        # inference doesn't pay the JIT-compile / weight-load cost. The
+        # response is discarded; the splash hides the latency.
+        self._show_splash("Warming up VLM...")
+        try:
+            dummy = np.zeros((448, 448, 3), dtype=np.uint8)
+            self.backend.vlm_inference(dummy, "ok", INFERENCE_TIMEOUT)
+            self.backend.poll_stream()  # drain any tokens the worker pushed
+            logger.info("VLM warm-up complete.")
+        except Exception as e:
+            logger.warning(f"VLM warm-up failed (non-fatal): {e}")
+
         # Best-effort init of speech I/O. Failures degrade gracefully.
-        self._show_splash("Loading speech models...")
-        self._init_voice_stack()
+        if self.speech_enabled or self.tts_enabled:
+            self._show_splash("Loading speech models...")
+            self._init_voice_stack()
 
         viewfinder_frame = None
         inference_frame = None
