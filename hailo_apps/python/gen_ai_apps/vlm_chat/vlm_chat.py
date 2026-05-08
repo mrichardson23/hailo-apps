@@ -49,6 +49,10 @@ STATE_EVENT = "EVENT"
 MONITOR_INTERVAL_DEFAULT = 1.0   # min seconds between successive captures
 MONITOR_COOLDOWN_DEFAULT = 10.0  # min seconds between fired events
 
+# Strength multiplier for the --blur-fov side-strip blur. 1.0 is the auto-
+# derived default; 2.0 is twice as blurry, 0.5 half.
+BLUR_STRENGTH = 0.3
+
 # Initialize logger
 logger = get_logger(__name__)
 
@@ -60,7 +64,8 @@ class VLMChatApp:
     def __init__(self,
                  speech_enabled: bool = True, tts_enabled: bool = True,
                  monitor_interval: float = MONITOR_INTERVAL_DEFAULT,
-                 monitor_cooldown: float = MONITOR_COOLDOWN_DEFAULT):
+                 monitor_cooldown: float = MONITOR_COOLDOWN_DEFAULT,
+                 blur_fov: bool = False):
         """
         Initialize the VLM Chat Application.
 
@@ -108,6 +113,9 @@ class VLMChatApp:
         self._last_monitor_view = None
         self.monitor_interval = monitor_interval
         self.monitor_cooldown = monitor_cooldown
+
+        # Whether to blur the left/right strips outside the central VLM crop.
+        self.blur_fov = blur_fov
 
     def signal_handler(self, sig, frame):
         """Handle interrupt signals."""
@@ -410,7 +418,7 @@ class VLMChatApp:
             # Warm up the freshly-loaded HEF so the next user inference is fast.
             self._show_splash("Warming up VLM...")
             try:
-                dummy = np.zeros((448, 448, 3), dtype=np.uint8)
+                dummy = np.zeros((336, 336, 3), dtype=np.uint8)
                 self.backend.vlm_inference(dummy, "ok", INFERENCE_TIMEOUT)
                 self.backend.poll_stream()
             except Exception as e:
@@ -487,8 +495,41 @@ class VLMChatApp:
             lines.append(current)
         return lines
 
+    @staticmethod
+    def _blur_side_strips(image) -> None:
+        """Blur the left/right strips outside the central square in place.
+
+        Visualises the centre crop the VLM actually sees (lores stream is
+        a square ROI of the same sensor, scaled to 336x336). Modifies
+        `image` directly — no allocations. cv2.blur is a separable box
+        filter (O(1) per pixel), so kernel size barely affects cost.
+
+        Tune the strength via the module-level `BLUR_STRENGTH` constant
+        above (1.0 default; 2.0 is twice as blurry, 0.5 half).
+        """
+        if BLUR_STRENGTH <= 0.0:
+            return
+        h, w = image.shape[:2]
+        if w <= h:
+            return
+        side_w = (w - h) // 2
+        if side_w < 4:
+            return
+        base = side_w // 4
+        k = int(max(3, min(301, base * BLUR_STRENGTH)))
+        if k % 2 == 0:
+            k += 1
+        left = image[:, :side_w]
+        right = image[:, w - side_w:]
+        cv2.blur(left, (k, k), dst=left)
+        cv2.blur(right, (k, k), dst=right)
+
     def _draw_overlay(self, frame):
-        """Compose the state-specific overlay on a copy of `frame` and return it."""
+        """Compose the state-specific overlay on a copy of `frame` and return it.
+
+        Note: the caller is expected to have already applied any blur-fov
+        treatment to `frame` so the captured snapshot inherits it.
+        """
         out = frame.copy()
         h, w = out.shape[:2]
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -571,6 +612,9 @@ class VLMChatApp:
             # Alpha: zoom-in stays opaque; zoom-out fades as it grows.
             alpha = s if is_exiting else 1.0
 
+            # The frozen frame was already blurred (when blur_fov is on) at
+            # the moment of capture, so the resize below inherits the blur
+            # automatically — no need to re-apply per draw.
             inset = cv2.resize(self.frozen_frame, (cur_w, cur_h), interpolation=cv2.INTER_AREA)
             x_clip0, x_clip1 = max(0, cur_x), min(w, cur_x + cur_w)
             y_clip0, y_clip1 = max(0, cur_y), min(h, cur_y + cur_h)
@@ -660,9 +704,13 @@ class VLMChatApp:
             # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference.
             # Raw stream is half the sensor's pixel array (binned mode) — sensor-agnostic.
             raw_size = tuple([v // 2 for v in picam2.camera_properties['PixelArraySize']])
+            # `lores` is sized to the VLM's native input (336x336) so we
+            # skip the cv2 central-crop step in convert_resize_image.
+            # preserve_ar=True asks picamera2 to crop the sensor ROI to a
+            # square (rather than stretch a 4:3/16:9 frame down).
             config = picam2.create_preview_configuration(
                 main={"size": (1920, 1080), "format": "RGB888"},
-                lores={"size": (448, 448), "format": "RGB888"},
+                lores={"size": (336, 336), "format": "RGB888", "preserve_ar": True},
                 raw={"size": raw_size},
             )
             picam2.configure(config)
@@ -722,7 +770,7 @@ class VLMChatApp:
         # response is discarded; the splash hides the latency.
         self._show_splash("Warming up VLM...")
         try:
-            dummy = np.zeros((448, 448, 3), dtype=np.uint8)
+            dummy = np.zeros((336, 336, 3), dtype=np.uint8)
             self.backend.vlm_inference(dummy, "ok", INFERENCE_TIMEOUT)
             self.backend.poll_stream()  # drain any tokens the worker pushed
             logger.info("VLM warm-up complete.")
@@ -748,6 +796,11 @@ class VLMChatApp:
                 # picamera2 'RGB888' yields BGR-ordered bytes in numpy (matching cv2). USB is BGR. No conversion needed.
                 viewfinder_frame = raw_view
                 inference_frame = raw_inf
+                # Blur in-place on the camera buffer (picamera2 hands us a
+                # fresh array each tick). Captured frozen_frame inherits
+                # the blur automatically.
+                if self.blur_fov:
+                    self._blur_side_strips(viewfinder_frame)
                 base_frame = viewfinder_frame
 
                 # If a transcription was running, see if it's ready.
@@ -1067,6 +1120,9 @@ if __name__ == "__main__":
                         help='Min seconds between successive captures in monitor mode (default 1.0).')
     parser.add_argument('--monitor-cooldown', type=float, default=MONITOR_COOLDOWN_DEFAULT,
                         help='Min seconds between fired events in monitor mode (default 10.0).')
+    parser.add_argument('--blur-fov', action='store_true',
+                        help='Blur the left/right strips outside the central square crop, '
+                             'so the live view + PiP show the actual VLM field of view.')
 
     # Handle --list-models flag before full initialization
     handle_list_models_flag(parser, VLM_CHAT_APP)
@@ -1087,6 +1143,7 @@ if __name__ == "__main__":
         tts_enabled=not options_menu.no_tts,
         monitor_interval=options_menu.monitor_interval,
         monitor_cooldown=options_menu.monitor_cooldown,
+        blur_fov=options_menu.blur_fov,
     )
     app.run()
     sys.exit(0)
