@@ -19,16 +19,10 @@ if repo_root is not None:
     sys.path.insert(0, str(repo_root))
 
 from hailo_apps.python.gen_ai_apps.vlm_chat.backend import Backend
-from hailo_apps.python.core.common.core import get_standalone_parser, get_resource_path, get_logger, handle_list_models_flag, resolve_hef_path
-from hailo_apps.python.core.common.camera_utils import get_usb_video_devices
-from hailo_apps.python.core.gstreamer.gstreamer_helper_pipelines import get_source_type
+from hailo_apps.python.core.common.core import get_standalone_parser, get_logger, handle_list_models_flag, resolve_hef_path
 from hailo_apps.python.core.common.defines import (
     VLM_CHAT_APP,
-    VLM_MODEL_NAME_H10,
-    RESOURCES_MODELS_DIR_NAME,
     HAILO10H_ARCH,
-    RPI_NAME_I,
-    USB_CAMERA,
     SHARED_VDEVICE_GROUP_ID,
 )
 
@@ -62,7 +56,7 @@ class VLMChatApp:
     Main application class for VLM Chat.
     Handles video display, user input, and interaction with the VLM backend.
     """
-    def __init__(self, camera: Any, camera_type: str,
+    def __init__(self,
                  speech_enabled: bool = True, tts_enabled: bool = True,
                  monitor_interval: float = MONITOR_INTERVAL_DEFAULT,
                  monitor_cooldown: float = MONITOR_COOLDOWN_DEFAULT):
@@ -70,13 +64,9 @@ class VLMChatApp:
         Initialize the VLM Chat Application.
 
         Args:
-            camera (Any): Camera source (device index or connection object).
-            camera_type (str): Type of camera ('usb' or 'rpi').
             speech_enabled (bool): If True, enable Whisper speech-to-text input.
             tts_enabled (bool): If True, enable Piper text-to-speech output.
         """
-        self.camera = camera
-        self.camera_type = camera_type
         self.running = True
         self.executor = concurrent.futures.ThreadPoolExecutor()
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -573,61 +563,43 @@ class VLMChatApp:
 
     def _init_camera(self) -> tuple[Callable[[], Any], Callable[[], None], str]:
         """
-        Initialize the camera based on type.
+        Initialize the picamera2 camera with dual streams.
 
         Returns:
             tuple: (get_frame_callback, cleanup_callback, camera_name)
         """
-        if self.camera_type == RPI_NAME_I:
-            try:
-                from picamera2 import Picamera2
-                from libcamera import controls
-                picam2 = Picamera2()
-                # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference.
-                # Raw stream is half the sensor's pixel array (binned mode) — sensor-agnostic.
-                raw_size = tuple([v // 2 for v in picam2.camera_properties['PixelArraySize']])
-                config = picam2.create_preview_configuration(
-                    main={"size": (1920, 1080), "format": "RGB888"},
-                    lores={"size": (448, 448), "format": "RGB888"},
-                    raw={"size": raw_size},
-                )
-                picam2.configure(config)
-                picam2.start()
-                # Enable continuous autofocus only if the sensor supports it.
-                if 'AfMode' in picam2.camera_controls:
-                    try:
-                        picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-                    except Exception as e:
-                        logger.debug(f"Failed to set continuous autofocus: {e}")
-                else:
-                    logger.debug("Sensor does not expose AfMode; skipping autofocus setup.")
-
-                def get_frame():
-                    arrays = picam2.capture_arrays(["main", "lores"])[0]
-                    return arrays[0], arrays[1]
-
-                cleanup = lambda: picam2.stop()
-                camera_name = "RPI"
-                return get_frame, cleanup, camera_name
-            except (ImportError, Exception) as e:
-                logger.error(f"Error initializing RPI camera: {e}")
-                raise
-        else:
-            cap = cv2.VideoCapture(self.camera)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_FPS, 30)
+        try:
+            from picamera2 import Picamera2
+            from libcamera import controls
+            picam2 = Picamera2()
+            # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference.
+            # Raw stream is half the sensor's pixel array (binned mode) — sensor-agnostic.
+            raw_size = tuple([v // 2 for v in picam2.camera_properties['PixelArraySize']])
+            config = picam2.create_preview_configuration(
+                main={"size": (1920, 1080), "format": "RGB888"},
+                lores={"size": (448, 448), "format": "RGB888"},
+                raw={"size": raw_size},
+            )
+            picam2.configure(config)
+            picam2.start()
+            # Enable continuous autofocus only if the sensor supports it.
+            if 'AfMode' in picam2.camera_controls:
+                try:
+                    picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+                except Exception as e:
+                    logger.debug(f"Failed to set continuous autofocus: {e}")
+            else:
+                logger.debug("Sensor does not expose AfMode; skipping autofocus setup.")
 
             def get_frame():
-                ret, fr = cap.read()
-                if not ret:
-                    return None, None
-                # USB has a single stream; use it for both viewfinder and inference
-                return fr, fr
+                arrays = picam2.capture_arrays(["main", "lores"])[0]
+                return arrays[0], arrays[1]
 
-            cleanup = lambda: cap.release()
-            camera_name = "USB"
-            return get_frame, cleanup, camera_name
+            cleanup = lambda: picam2.stop()
+            return get_frame, cleanup, "RPI"
+        except (ImportError, Exception) as e:
+            logger.error(f"Error initializing RPI camera: {e}")
+            raise
 
     def show_video(self):
         """Main loop: render video + overlay and handle keystrokes from the cv2 window."""
@@ -1001,30 +973,7 @@ if __name__ == "__main__":
     if hef_path is None:
         logger.error("Failed to resolve HEF path for VLM model. Exiting.")
         sys.exit(1)
-    video_source = options_menu.input
-    if video_source == USB_CAMERA:
-        logger.debug("USB_CAMERA detected; scanning USB devices...")
-        video_source = get_usb_video_devices()
-        if not video_source:
-            logger.error("No USB camera found for '--input usb'")
-            print(
-                'Provided argument "--input" is set to "usb", however no available USB cameras found. Please connect a camera or specifiy different input method.'
-            )
-            sys.exit(1)
-        else:
-            logger.debug(f"Using USB camera: {video_source[0]}")
-            video_source = video_source[0]
-
-    # Determine source type (usb, rpi, file, etc.)
-    source_type = get_source_type(video_source) if video_source is not None else None
-
-    if video_source is None:
-        print('Please provide an input source using the "--input" argument: "usb" for USB camera or "rpi" for Raspberry Pi camera.')
-        sys.exit(1)
-
     app = VLMChatApp(
-        camera=video_source,
-        camera_type=source_type,
         speech_enabled=not options_menu.no_stt,
         tts_enabled=not options_menu.no_tts,
         monitor_interval=options_menu.monitor_interval,
