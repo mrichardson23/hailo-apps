@@ -69,6 +69,7 @@ class VLMChatApp:
         self.executor = concurrent.futures.ThreadPoolExecutor()
         signal.signal(signal.SIGINT, self.signal_handler)
         self.frozen_frame = None
+        self.frozen_inference_frame = None
         self.current_state = STATE_STREAMING
         self.user_question = ''
         self.backend: Optional[Backend] = None
@@ -137,10 +138,18 @@ class VLMChatApp:
             try:
                 from picamera2 import Picamera2
                 picam2 = Picamera2()
-                config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+                # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference
+                config = picam2.create_preview_configuration(
+                    main={"size": (960, 720),"format": "BGR888"},
+                    lores={"size": (640, 480), "format": "BGR888"},
+                )
                 picam2.configure(config)
                 picam2.start()
-                get_frame = lambda: picam2.capture_array()
+
+                def get_frame():
+                    arrays = picam2.capture_arrays(["main", "lores"])[0]
+                    return arrays[0], arrays[1]
+
                 cleanup = lambda: picam2.stop()
                 camera_name = "RPI"
                 return get_frame, cleanup, camera_name
@@ -152,7 +161,14 @@ class VLMChatApp:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 30)
-            get_frame = lambda: (lambda r: r[1] if r[0] else None)(cap.read())
+
+            def get_frame():
+                ret, fr = cap.read()
+                if not ret:
+                    return None, None
+                # USB has a single stream; use it for both viewfinder and inference
+                return fr, fr
+
             cleanup = lambda: cap.release()
             camera_name = "USB"
             return get_frame, cleanup, camera_name
@@ -183,6 +199,9 @@ class VLMChatApp:
             self.running = False
             return
 
+        # Create the display window without the Qt toolbar/status bar
+        cv2.namedWindow('Video', cv2.WINDOW_AUTOSIZE | cv2.WINDOW_GUI_NORMAL)
+
         # Initialize Backend
         try:
             # Use globally resolved hef_path
@@ -204,24 +223,29 @@ class VLMChatApp:
         # Initial Prompt
         self._print_state_prompt()
 
-        # Ensure frame is defined in outer scope for safety
-        frame = None
+        # Ensure frames are defined in outer scope for safety
+        viewfinder_frame = None
+        inference_frame = None
 
         try:
             while self.running:
                 # Display Logic
                 if self.current_state == STATE_STREAMING:
-                    raw_frame = get_frame()
-                    if raw_frame is None:
+                    raw_view, raw_inf = get_frame()
+                    if raw_view is None:
                         logger.error("Failed to read frame from camera")
                         break
 
-                    # Pre-process frame to show user exactly what the model sees
-                    # This ensures live video matches the aspect ratio (central crop)
-                    rgb_frame = Backend.convert_resize_image(raw_frame)
-                    frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+                    # Viewfinder: show the larger 1280x1280 stream (RPI) or the
+                    # single USB frame. picamera2 returns RGB; convert to BGR for cv2.
+                    if self.camera_type == RPI_NAME_I:
+                        viewfinder_frame = cv2.cvtColor(raw_view, cv2.COLOR_RGB2BGR)
+                        inference_frame = cv2.cvtColor(raw_inf, cv2.COLOR_RGB2BGR)
+                    else:
+                        viewfinder_frame = raw_view
+                        inference_frame = raw_inf
 
-                    cv2.imshow('Video', frame)
+                    cv2.imshow('Video', viewfinder_frame)
                 elif self.current_state in [STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT]:
                     if self.frozen_frame is not None:
                         cv2.imshow('Video', self.frozen_frame)
@@ -243,10 +267,10 @@ class VLMChatApp:
                             self.stop()
                             break
 
-                        # Capture current frame
-                        # Note: frame variable holds the last captured frame from the display block
-                        if frame is not None:
-                            self.frozen_frame = frame.copy()
+                        # Capture current frames: viewfinder for display, inference frame for the model
+                        if viewfinder_frame is not None and inference_frame is not None:
+                            self.frozen_frame = viewfinder_frame.copy()
+                            self.frozen_inference_frame = inference_frame.copy()
                             self.current_state = STATE_CAPTURED
                             self._print_state_prompt()
 
@@ -256,6 +280,7 @@ class VLMChatApp:
                         if stripped.lower() in ['q', 'quit']:
                             self.current_state = STATE_STREAMING
                             self.frozen_frame = None
+                            self.frozen_inference_frame = None
                             self._print_state_prompt()
                             continue
 
@@ -263,9 +288,9 @@ class VLMChatApp:
                         if not stripped:
                             print(f"Using default prompt: '{self.user_question}'")
 
-                        if SAVE_FRAMES and self.frozen_frame is not None:
+                        if SAVE_FRAMES and self.frozen_inference_frame is not None:
                             timestamp = time.strftime("%Y%m%d-%H%M%S")
-                            cv2.imwrite(f"frame_{timestamp}.jpg", self.frozen_frame)
+                            cv2.imwrite(f"frame_{timestamp}.jpg", self.frozen_inference_frame)
                             print(f"Frame saved as frame_{timestamp}.jpg")
 
                         self.current_state = STATE_PROCESSING
@@ -273,7 +298,7 @@ class VLMChatApp:
 
                         vlm_future = self.executor.submit(
                             self.backend.vlm_inference,
-                            self.frozen_frame.copy(),
+                            self.frozen_inference_frame.copy(),
                             self.user_question,
                             INFERENCE_TIMEOUT
                         )
@@ -299,6 +324,7 @@ class VLMChatApp:
                     if user_input is not None: # User pressed Enter
                         self.current_state = STATE_STREAMING
                         self.frozen_frame = None
+                        self.frozen_inference_frame = None
                         self._print_state_prompt()
 
         finally:
