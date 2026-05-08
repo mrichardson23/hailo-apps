@@ -202,14 +202,21 @@ class VLMChatApp:
         if self.camera_type == RPI_NAME_I:
             try:
                 from picamera2 import Picamera2
+                from libcamera import controls
                 picam2 = Picamera2()
                 # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference
                 config = picam2.create_preview_configuration(
-                    main={"size": (960, 720), "format": "RGB888"},
+                    main={"size": (1280, 720), "format": "RGB888"},
                     lores={"size": (640, 480), "format": "RGB888"},
+                    raw={"size": (2304, 1296)},
                 )
                 picam2.configure(config)
                 picam2.start()
+                # Enable continuous autofocus (no-op on fixed-focus sensors).
+                try:
+                    picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+                except Exception as e:
+                    logger.debug(f"Continuous autofocus not available: {e}")
 
                 def get_frame():
                     arrays = picam2.capture_arrays(["main", "lores"])[0]
