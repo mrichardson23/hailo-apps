@@ -45,6 +45,14 @@ STATE_STREAMING = "STREAMING"
 STATE_CAPTURED = "CAPTURED"
 STATE_PROCESSING = "PROCESSING"
 STATE_RESULT = "RESULT"
+# Event-trigger / monitor mode states.
+STATE_TRIGGER_SETUP = "TRIGGER_SETUP"
+STATE_MONITORING = "MONITORING"
+STATE_EVENT = "EVENT"
+
+# Monitor mode defaults.
+MONITOR_INTERVAL_DEFAULT = 1.0   # min seconds between successive captures
+MONITOR_COOLDOWN_DEFAULT = 30.0  # min seconds between fired events
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -55,7 +63,9 @@ class VLMChatApp:
     Handles video display, user input, and interaction with the VLM backend.
     """
     def __init__(self, camera: Any, camera_type: str,
-                 speech_enabled: bool = True, tts_enabled: bool = True):
+                 speech_enabled: bool = True, tts_enabled: bool = True,
+                 monitor_interval: float = MONITOR_INTERVAL_DEFAULT,
+                 monitor_cooldown: float = MONITOR_COOLDOWN_DEFAULT):
         """
         Initialize the VLM Chat Application.
 
@@ -94,6 +104,18 @@ class VLMChatApp:
         self.tts_buffer = ''
         self.tts_gen_id: Optional[int] = None
         self.tts_first_chunk = True
+        # Recording helpers can fill either user_question (default) or trigger_text.
+        self._active_text_target = 'user_question'
+
+        # Event-trigger / monitor state.
+        self.trigger_text = ''
+        self.last_event_text = ''
+        self.last_capture_time = 0.0
+        self.last_event_time = 0.0
+        self.monitor_future: Optional[concurrent.futures.Future] = None
+        self._last_monitor_view = None
+        self.monitor_interval = monitor_interval
+        self.monitor_cooldown = monitor_cooldown
 
     def signal_handler(self, sig, frame):
         """Handle interrupt signals."""
@@ -111,6 +133,10 @@ class VLMChatApp:
             except Exception as e:
                 logger.debug(f"Error stopping recorder: {e}")
             self.is_recording = False
+        # Cancel any in-flight monitor inference best-effort.
+        if self.monitor_future is not None:
+            self.monitor_future.cancel()
+            self.monitor_future = None
         if self.tts is not None:
             try:
                 self.tts.stop()
@@ -173,7 +199,8 @@ class VLMChatApp:
     def _start_recording(self) -> None:
         if self.audio_recorder is None:
             return
-        self.user_question = ''
+        # Clear whichever text field is being filled (user_question or trigger_text).
+        setattr(self, self._active_text_target, '')
         self.has_typed = False
         try:
             self.audio_recorder.start()
@@ -203,7 +230,7 @@ class VLMChatApp:
         try:
             text = self.transcribe_future.result()
             if text:
-                self.user_question = text.strip()
+                setattr(self, self._active_text_target, text.strip())
                 # Transcribed text shouldn't suppress Space-to-record — only manual typing does.
                 self.has_typed = False
         except Exception as e:
@@ -271,15 +298,87 @@ class VLMChatApp:
         self.tts_first_chunk = True
 
     @staticmethod
-    def _draw_translucent_box(frame, x: int, y: int, w: int, h: int, alpha: float = 0.55) -> None:
-        """Darken a region of `frame` in-place, simulating a translucent black box."""
+    def _build_monitor_prompt(trigger: str) -> str:
+        """Construct the user prompt for monitor-mode VLM calls.
+
+        Single-instruction prompt: 'Only say YES if you see X' generalises
+        better than the descriptive-then-match pattern. Combined with the
+        keyword + negation parser, this catches both well-formed YES/NO
+        replies and chatty ones.
+        """
+        return f"Only say YES if you see {trigger} in the image. Otherwise say NO."
+
+    def _classify_monitor_response(self, answer: str) -> tuple:
+        """Decide whether `answer` indicates the trigger has fired.
+
+        Single rule: fire iff the answer begins with 'yes' (case-
+        insensitive, word boundary). The monitor prompt explicitly asks
+        for YES or NO, so anything else is treated as a non-fire.
+
+        Returns (fired: bool, description: str).
+        """
+        if not answer:
+            return (False, '')
+        stripped = answer.lstrip()
+        import re
+        if re.match(r"^yes\b", stripped, re.IGNORECASE):
+            tail = stripped[3:].lstrip(" \t\n,;:.-—–")
+            return (True, tail or self.trigger_text)
+        return (False, '')
+
+    def _fire_event(self, description: str, frame) -> None:
+        """Latch the alert: capture the current viewfinder for the PiP and switch to STATE_EVENT.
+
+        The PiP shows the *current* live frame (at fire time), not the
+        frame that was inferred — the latter can be 1–3 s stale by the
+        time inference completes, which feels wrong in a security-alert
+        UX.
+        """
+        if frame is None:
+            return
+        self.last_event_time = time.time()
+        self.last_event_text = description.strip() or "(no description)"
+        # Reuse the existing PiP zoom-in animation by populating frozen_frame.
+        self.frozen_frame = frame.copy()
+        self.pip_anim_start = time.time()
+        self.pip_anim_out_start = None
+        self.current_state = STATE_EVENT
+        # Speak the description if TTS is enabled.
+        if self.tts is not None:
+            try:
+                self._tts_interrupt()
+                gen_id = self.tts.get_current_gen_id()
+                self.tts.queue_text("Event detected. " + self.last_event_text, gen_id)
+            except Exception as e:
+                logger.debug(f"TTS event announcement failed: {e}")
+
+    def _cancel_monitor_future(self) -> None:
+        """Best-effort cancel of an in-flight monitor inference."""
+        if self.monitor_future is not None:
+            self.monitor_future.cancel()
+            self.monitor_future = None
+
+    @staticmethod
+    def _draw_translucent_box(frame, x: int, y: int, w: int, h: int,
+                              alpha: float = 0.55, tint=None) -> None:
+        """Tint a region of `frame` in-place.
+
+        With `tint=None`, darkens the ROI (translucent black). With a BGR
+        `tint` tuple, blends the ROI toward that colour (translucent
+        coloured box) — used for the red EVENT alert overlay.
+        """
         h_f, w_f = frame.shape[:2]
         x0, y0 = max(0, x), max(0, y)
         x1, y1 = min(w_f, x + w), min(h_f, y + h)
         if x1 <= x0 or y1 <= y0:
             return
         roi = frame[y0:y1, x0:x1]
-        cv2.addWeighted(roi, 1.0 - alpha, roi, 0.0, 0.0, dst=roi)
+        if tint is None:
+            cv2.addWeighted(roi, 1.0 - alpha, roi, 0.0, 0.0, dst=roi)
+        else:
+            import numpy as np
+            tint_arr = np.full_like(roi, tint, dtype=roi.dtype)
+            cv2.addWeighted(tint_arr, alpha, roi, 1.0 - alpha, 0.0, dst=roi)
 
     @staticmethod
     def _wrap_text(text: str, max_width_px: int, font: int, scale: float, thickness: int) -> list:
@@ -324,9 +423,12 @@ class VLMChatApp:
         margin = max(8, w // 80)
         line_h = int(28 * scale) + 6
 
+        # Red tint when an event is firing; black darken otherwise.
+        box_tint = (0, 0, 180) if self.current_state == STATE_EVENT else None
+
         # Top banner: state header.
         if self.current_state == STATE_STREAMING:
-            header = "LIVE  |  Enter: capture   Q/Esc: quit"
+            header = "LIVE  |  Enter: capture   T: trigger   Q/Esc: quit"
         elif self.current_state == STATE_CAPTURED:
             if self.is_recording:
                 header = "Recording...  |  Space: stop"
@@ -340,11 +442,24 @@ class VLMChatApp:
             header = "Processing..."
         elif self.current_state == STATE_RESULT:
             header = "Enter: continue   Q/Esc: quit"
+        elif self.current_state == STATE_TRIGGER_SETUP:
+            if self.is_recording:
+                header = "Recording trigger...  |  Space: stop"
+            elif self.is_transcribing:
+                header = "Transcribing..."
+            elif self.speech_enabled:
+                header = "Type or Space to record  |  Enter: arm   Esc: cancel"
+            else:
+                header = "Type sentence  |  Enter: arm   Esc: cancel"
+        elif self.current_state == STATE_MONITORING:
+            header = f"Monitoring: {self.trigger_text}  |  t: change   Esc: stop"
+        elif self.current_state == STATE_EVENT:
+            header = "EVENT  |  Enter / t: resume monitoring   Esc: stop"
         else:
             header = ""
 
         banner_h = line_h + 2 * margin
-        self._draw_translucent_box(out, 0, 0, w, banner_h, alpha=0.55)
+        self._draw_translucent_box(out, 0, 0, w, banner_h, alpha=0.55, tint=box_tint)
         cv2.putText(out, header, (margin, margin + line_h - 6),
                     font, scale, text_color, thickness, cv2.LINE_AA)
 
@@ -359,7 +474,7 @@ class VLMChatApp:
             t = max(0.0, min(1.0, 1.0 - elapsed / anim_duration))
             s = t * t * t  # ease-in cubic for zoom-out
             is_exiting = True
-        elif (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT)
+        elif (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT, STATE_EVENT)
                 and self.frozen_frame is not None):
             elapsed = (time.time() - self.pip_anim_start) if self.pip_anim_start is not None else anim_duration
             t = max(0.0, min(1.0, elapsed / anim_duration))
@@ -403,7 +518,7 @@ class VLMChatApp:
                                   (cur_x + cur_w, cur_y + cur_h),
                                   (border_intensity, border_intensity, border_intensity), 1)
 
-        # Bottom panel: question / response.
+        # Bottom panel: question / response / trigger / event.
         panel_lines = []
         max_text_w = w - 2 * margin
         if self.current_state == STATE_CAPTURED:
@@ -417,6 +532,14 @@ class VLMChatApp:
             response_text = self.streamed_response.strip()
             r_lines = self._wrap_text(response_text, max_text_w, font, scale, thickness) if response_text else []
             panel_lines = q_lines + ([''] + r_lines if r_lines else [])
+        elif self.current_state == STATE_TRIGGER_SETUP:
+            caret = "" if (self.is_recording or self.is_transcribing) else "_"
+            panel_lines = self._wrap_text("What to trigger on: " + self.trigger_text + caret,
+                                          max_text_w, font, scale, thickness)
+        elif self.current_state == STATE_EVENT:
+            panel_lines = self._wrap_text("Event detected: " + self.last_event_text,
+                                          max_text_w, font, scale, thickness)
+        # STATE_MONITORING: leave the bottom panel empty so the live feed is uncluttered.
 
         if panel_lines:
             max_panel_lines = max(1, int(h * 0.45) // line_h)
@@ -424,7 +547,7 @@ class VLMChatApp:
                 panel_lines = panel_lines[-max_panel_lines:]
             panel_h = len(panel_lines) * line_h + 2 * margin
             panel_y = h - panel_h
-            self._draw_translucent_box(out, 0, panel_y, w, panel_h, alpha=0.55)
+            self._draw_translucent_box(out, 0, panel_y, w, panel_h, alpha=0.55, tint=box_tint)
             for i, line in enumerate(panel_lines):
                 y = panel_y + margin + (i + 1) * line_h - 6
                 cv2.putText(out, line, (margin, y),
@@ -614,6 +737,43 @@ class VLMChatApp:
                         INFERENCE_TIMEOUT
                     )
 
+                # Monitor mode: kick off a periodic VLM call when no future is in flight.
+                if (self.current_state == STATE_MONITORING
+                        and self.monitor_future is None
+                        and self.backend is not None
+                        and inference_frame is not None
+                        and time.time() - self.last_capture_time >= self.monitor_interval):
+                    self.last_capture_time = time.time()
+                    self._last_monitor_view = (
+                        viewfinder_frame.copy() if viewfinder_frame is not None else None
+                    )
+                    self.monitor_future = self.executor.submit(
+                        self.backend.vlm_inference,
+                        inference_frame.copy(),
+                        self._build_monitor_prompt(self.trigger_text),
+                        INFERENCE_TIMEOUT,
+                    )
+
+                # Monitor result handling.
+                if (self.current_state == STATE_MONITORING
+                        and self.monitor_future is not None
+                        and self.monitor_future.done()):
+                    try:
+                        m_result = self.monitor_future.result()
+                        m_answer = (m_result.get('answer') if isinstance(m_result, dict) else '') or ''
+                    except Exception as e:
+                        logger.error(f"Monitor inference failed: {e}")
+                        m_answer = ''
+                    self.monitor_future = None
+                    fired, description = self._classify_monitor_response(m_answer)
+                    cooldown_ok = time.time() - self.last_event_time >= self.monitor_cooldown
+                    # Honour the alert cooldown (skill recipe) so a continuously-
+                    # satisfied trigger doesn't flap.
+                    if fired and cooldown_ok:
+                        # Pass the *current* viewfinder so the PiP is fresh,
+                        # not stale by the inference latency.
+                        self._fire_event(description, viewfinder_frame)
+
         finally:
             cleanup()
             cv2.destroyAllWindows()
@@ -632,6 +792,13 @@ class VLMChatApp:
             if key == ESC or key in (ord('q'), ord('Q')):
                 self.stop()
                 return
+            if key in (ord('t'), ord('T')):
+                # Enter trigger-setup mode for the event monitor.
+                self.trigger_text = ''
+                self.has_typed = False
+                self._active_text_target = 'trigger_text'
+                self.current_state = STATE_TRIGGER_SETUP
+                return
             if key in ENTER:
                 if viewfinder_frame is not None and inference_frame is not None:
                     self.frozen_frame = viewfinder_frame.copy()
@@ -639,6 +806,7 @@ class VLMChatApp:
                     self.user_question = ''
                     self.streamed_response = ''
                     self.has_typed = False
+                    self._active_text_target = 'user_question'
                     self.pip_anim_start = time.time()
                     self.pip_anim_out_start = None  # cancel any in-progress slide-out
                     self.current_state = STATE_CAPTURED
@@ -706,6 +874,97 @@ class VLMChatApp:
             if key in ENTER:
                 self._dismiss_pip()
                 self.current_state = STATE_STREAMING
+            return
+
+        if self.current_state == STATE_TRIGGER_SETUP:
+            SPACE = 32
+
+            # Space toggles recording until the user starts typing — same rule as CAPTURED.
+            if (key == SPACE and self.speech_enabled
+                    and self.audio_recorder is not None
+                    and not self.is_transcribing
+                    and not self.has_typed):
+                if self.is_recording:
+                    self._stop_recording_and_transcribe()
+                else:
+                    self._start_recording()
+                return
+
+            if self.is_recording or self.is_transcribing:
+                if key == ESC:
+                    self._abort_recording()
+                    self.is_transcribing = False
+                    self.transcribe_future = None
+                    self._active_text_target = 'user_question'
+                    self.current_state = STATE_STREAMING
+                return
+
+            if key == ESC:
+                self._abort_recording()
+                self._active_text_target = 'user_question'
+                self.current_state = STATE_STREAMING
+                return
+            if key in ENTER:
+                self._abort_recording()
+                if not self.trigger_text.strip():
+                    self.trigger_text = "Describe activity in the scene."
+                self._active_text_target = 'user_question'
+                self.last_capture_time = 0.0    # fire first monitor capture immediately
+                self.last_event_time = 0.0      # cooldown not yet active
+                self.current_state = STATE_MONITORING
+                return
+            if key in BACKSPACE:
+                self.trigger_text = self.trigger_text[:-1]
+                self.has_typed = True
+                return
+            if 32 <= key <= 126:
+                self.trigger_text += chr(key)
+                self.has_typed = True
+            return
+
+        if self.current_state == STATE_MONITORING:
+            if key == ESC or key in (ord('q'), ord('Q')):
+                self._cancel_monitor_future()
+                self.trigger_text = ''
+                self.current_state = STATE_STREAMING
+                return
+            if key in (ord('t'), ord('T')):
+                self._cancel_monitor_future()
+                self.trigger_text = ''
+                self.has_typed = False
+                self._active_text_target = 'trigger_text'
+                self.current_state = STATE_TRIGGER_SETUP
+            return
+
+        if self.current_state == STATE_EVENT:
+            if key == ESC:
+                self._tts_interrupt()
+                self._cancel_monitor_future()
+                self.trigger_text = ''
+                self.last_event_time = 0.0
+                self._dismiss_pip()
+                self.current_state = STATE_STREAMING
+                return
+            if key in ENTER:
+                self._tts_interrupt()
+                self._dismiss_pip()
+                # Manual dismiss → reset the cooldown so the next detection fires
+                # immediately. The cooldown's only purpose was to suppress
+                # repeat-fires while already alerted, which the state machine
+                # enforces anyway by not submitting in STATE_EVENT.
+                self.last_event_time = 0.0
+                self.last_capture_time = time.time()  # respect cadence after dismiss
+                self.current_state = STATE_MONITORING
+                return
+            if key in (ord('t'), ord('T')):
+                self._tts_interrupt()
+                self._cancel_monitor_future()
+                self._dismiss_pip()
+                self.trigger_text = ''
+                self.last_event_time = 0.0
+                self.has_typed = False
+                self._active_text_target = 'trigger_text'
+                self.current_state = STATE_TRIGGER_SETUP
 
     def run(self):
         """Start the application thread."""
@@ -723,6 +982,10 @@ if __name__ == "__main__":
                         help='Disable speech-to-text (Whisper) input. Type the question instead.')
     parser.add_argument('--no-tts', action='store_true',
                         help='Disable text-to-speech (Piper) output of the response.')
+    parser.add_argument('--monitor-interval', type=float, default=MONITOR_INTERVAL_DEFAULT,
+                        help='Min seconds between successive captures in monitor mode (default 1.0).')
+    parser.add_argument('--monitor-cooldown', type=float, default=MONITOR_COOLDOWN_DEFAULT,
+                        help='Min seconds between fired events in monitor mode (default 30.0).')
 
     # Handle --list-models flag before full initialization
     handle_list_models_flag(parser, VLM_CHAT_APP)
@@ -764,6 +1027,8 @@ if __name__ == "__main__":
         camera_type=source_type,
         speech_enabled=not options_menu.no_stt,
         tts_enabled=not options_menu.no_tts,
+        monitor_interval=options_menu.monitor_interval,
+        monitor_cooldown=options_menu.monitor_cooldown,
     )
     app.run()
     sys.exit(0)
