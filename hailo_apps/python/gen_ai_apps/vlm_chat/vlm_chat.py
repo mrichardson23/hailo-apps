@@ -28,7 +28,8 @@ from hailo_apps.python.core.common.defines import (
     RESOURCES_MODELS_DIR_NAME,
     HAILO10H_ARCH,
     RPI_NAME_I,
-    USB_CAMERA
+    USB_CAMERA,
+    SHARED_VDEVICE_GROUP_ID,
 )
 
 # Configuration Constants
@@ -53,13 +54,16 @@ class VLMChatApp:
     Main application class for VLM Chat.
     Handles video display, user input, and interaction with the VLM backend.
     """
-    def __init__(self, camera: Any, camera_type: str):
+    def __init__(self, camera: Any, camera_type: str,
+                 speech_enabled: bool = True, tts_enabled: bool = True):
         """
         Initialize the VLM Chat Application.
 
         Args:
             camera (Any): Camera source (device index or connection object).
             camera_type (str): Type of camera ('usb' or 'rpi').
+            speech_enabled (bool): If True, enable Whisper speech-to-text input.
+            tts_enabled (bool): If True, enable Piper text-to-speech output.
         """
         self.camera = camera
         self.camera_type = camera_type
@@ -76,6 +80,21 @@ class VLMChatApp:
         self.backend: Optional[Backend] = None
         self.video_thread: Optional[threading.Thread] = None
 
+        # Speech / TTS feature state — voice components are initialised lazily in show_video.
+        self.speech_enabled = speech_enabled
+        self.tts_enabled = tts_enabled
+        self.is_recording = False
+        self.is_transcribing = False
+        self.has_typed = False  # Once True, Space is a normal char, not a record toggle
+        self.transcribe_future: Optional[concurrent.futures.Future] = None
+        self.audio_recorder = None
+        self.s2t = None
+        self.tts = None
+        self.stt_vdevice = None
+        self.tts_buffer = ''
+        self.tts_gen_id: Optional[int] = None
+        self.tts_first_chunk = True
+
     def signal_handler(self, sig, frame):
         """Handle interrupt signals."""
         print('')
@@ -85,9 +104,171 @@ class VLMChatApp:
     def stop(self):
         """Stop the application and clean up resources."""
         self.running = False
+        # Tear down audio first so nothing is still streaming to the speakers / mic.
+        if self.is_recording and self.audio_recorder is not None:
+            try:
+                self.audio_recorder.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping recorder: {e}")
+            self.is_recording = False
+        if self.tts is not None:
+            try:
+                self.tts.stop()
+            except Exception as e:
+                logger.debug(f"Error stopping TTS: {e}")
+        if self.audio_recorder is not None:
+            close_fn = getattr(self.audio_recorder, 'close', None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception as e:
+                    logger.debug(f"Error closing recorder: {e}")
+        if self.stt_vdevice is not None:
+            try:
+                self.stt_vdevice.release()
+            except Exception as e:
+                logger.debug(f"Error releasing STT VDevice: {e}")
         if self.backend:
             self.backend.close()
         self.executor.shutdown(wait=True)
+
+    def _init_voice_stack(self) -> None:
+        """Best-effort init of STT/TTS components. Failure disables the feature, not the app."""
+        if self.speech_enabled:
+            try:
+                from hailo_platform import VDevice
+                from hailo_apps.python.gen_ai_apps.gen_ai_utils.voice_processing.speech_to_text import SpeechToTextProcessor
+                from hailo_apps.python.gen_ai_apps.gen_ai_utils.voice_processing.audio_recorder import AudioRecorder
+                params = VDevice.create_params()
+                params.group_id = SHARED_VDEVICE_GROUP_ID
+                self.stt_vdevice = VDevice(params)
+                self.s2t = SpeechToTextProcessor(self.stt_vdevice)
+                self.audio_recorder = AudioRecorder(device_id=None, debug=False)
+                logger.info("Speech-to-text initialised (Whisper).")
+            except Exception as e:
+                logger.warning(f"Speech input disabled: {e}")
+                self.speech_enabled = False
+                self.s2t = None
+                self.audio_recorder = None
+                if self.stt_vdevice is not None:
+                    try:
+                        self.stt_vdevice.release()
+                    except Exception:
+                        pass
+                    self.stt_vdevice = None
+
+        if self.tts_enabled:
+            try:
+                from hailo_apps.python.gen_ai_apps.gen_ai_utils.voice_processing.text_to_speech import (
+                    TextToSpeechProcessor, check_piper_model_installed,
+                )
+                check_piper_model_installed()
+                self.tts = TextToSpeechProcessor(device_id=None)
+                logger.info("Text-to-speech initialised (Piper).")
+            except Exception as e:
+                logger.warning(f"TTS disabled: {e}")
+                self.tts_enabled = False
+                self.tts = None
+
+    def _start_recording(self) -> None:
+        if self.audio_recorder is None:
+            return
+        self.user_question = ''
+        self.has_typed = False
+        try:
+            self.audio_recorder.start()
+            self.is_recording = True
+        except Exception as e:
+            logger.error(f"Failed to start recording: {e}")
+            self.is_recording = False
+
+    def _stop_recording_and_transcribe(self) -> None:
+        if self.audio_recorder is None or not self.is_recording:
+            return
+        try:
+            audio = self.audio_recorder.stop()
+        except Exception as e:
+            logger.error(f"Failed to stop recording: {e}")
+            self.is_recording = False
+            return
+        self.is_recording = False
+        if audio is None or len(audio) == 0 or self.s2t is None:
+            return
+        self.is_transcribing = True
+        self.transcribe_future = self.executor.submit(self.s2t.transcribe, audio, "en", 15000)
+
+    def _poll_transcription(self) -> None:
+        if self.transcribe_future is None or not self.transcribe_future.done():
+            return
+        try:
+            text = self.transcribe_future.result()
+            if text:
+                self.user_question = text.strip()
+                # Transcribed text shouldn't suppress Space-to-record — only manual typing does.
+                self.has_typed = False
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+        finally:
+            self.transcribe_future = None
+            self.is_transcribing = False
+
+    def _abort_recording(self) -> None:
+        """Discard any in-progress recording (used when leaving CAPTURED state)."""
+        if self.is_recording and self.audio_recorder is not None:
+            try:
+                self.audio_recorder.stop()
+            except Exception as e:
+                logger.debug(f"Error aborting recorder: {e}")
+            self.is_recording = False
+
+    def _tts_begin(self) -> None:
+        if self.tts is None:
+            return
+        try:
+            self.tts.interrupt()
+            if hasattr(self.tts, 'clear_interruption'):
+                self.tts.clear_interruption()
+            self.tts_gen_id = self.tts.get_current_gen_id()
+            self.tts_buffer = ''
+            self.tts_first_chunk = True
+        except Exception as e:
+            logger.debug(f"Error starting TTS generation: {e}")
+
+    def _tts_feed(self, new_text: str) -> None:
+        if self.tts is None or self.tts_gen_id is None or not new_text:
+            return
+        self.tts_buffer += new_text
+        try:
+            self.tts_buffer = self.tts.chunk_and_queue(
+                self.tts_buffer, self.tts_gen_id, self.tts_first_chunk
+            )
+            # Once anything has been queued, switch to sentence-only chunking.
+            if self.tts_first_chunk and not self.tts.speech_queue.empty():
+                self.tts_first_chunk = False
+        except Exception as e:
+            logger.debug(f"Error queuing TTS chunk: {e}")
+
+    def _tts_flush(self) -> None:
+        if self.tts is None or self.tts_gen_id is None:
+            return
+        tail = self.tts_buffer.strip()
+        if tail:
+            try:
+                self.tts.queue_text(tail, self.tts_gen_id)
+            except Exception as e:
+                logger.debug(f"Error flushing TTS tail: {e}")
+        self.tts_buffer = ''
+
+    def _tts_interrupt(self) -> None:
+        if self.tts is None:
+            return
+        try:
+            self.tts.interrupt()
+        except Exception as e:
+            logger.debug(f"Error interrupting TTS: {e}")
+        self.tts_buffer = ''
+        self.tts_gen_id = None
+        self.tts_first_chunk = True
 
     @staticmethod
     def _draw_translucent_box(frame, x: int, y: int, w: int, h: int, alpha: float = 0.55) -> None:
@@ -147,7 +328,14 @@ class VLMChatApp:
         if self.current_state == STATE_STREAMING:
             header = "LIVE  |  Enter: capture   Q/Esc: quit"
         elif self.current_state == STATE_CAPTURED:
-            header = "Type question  |  Enter: send   Esc: cancel"
+            if self.is_recording:
+                header = "Recording...  |  Space: stop"
+            elif self.is_transcribing:
+                header = "Transcribing..."
+            elif self.speech_enabled:
+                header = "Type or Space to record  |  Enter: send   Esc: cancel"
+            else:
+                header = "Type question  |  Enter: send   Esc: cancel"
         elif self.current_state == STATE_PROCESSING:
             header = "Processing..."
         elif self.current_state == STATE_RESULT:
@@ -161,38 +349,45 @@ class VLMChatApp:
                     font, scale, text_color, thickness, cv2.LINE_AA)
 
         # Picture-in-picture inset of the captured frame (top-right), with a
-        # slide-in + slide-out animation. `eased` is a 0..1 visibility factor
-        # (0 = off-screen right, 1 = settled at final position).
+        # zoom-in / zoom-out animation. `s` is a 0..1 shrink factor:
+        # 0 = filling the whole frame, 1 = settled at the small PiP rect.
         anim_duration = 0.35
-        eased = None
+        s = None
+        is_exiting = False
         if self.pip_anim_out_start is not None and self.frozen_frame is not None:
             elapsed = time.time() - self.pip_anim_out_start
             t = max(0.0, min(1.0, 1.0 - elapsed / anim_duration))
-            eased = t * t * t  # ease-in cubic (fast at first, slows toward gone)
+            s = t * t * t  # ease-in cubic for zoom-out
+            is_exiting = True
         elif (self.current_state in (STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT)
                 and self.frozen_frame is not None):
             elapsed = (time.time() - self.pip_anim_start) if self.pip_anim_start is not None else anim_duration
             t = max(0.0, min(1.0, elapsed / anim_duration))
-            eased = 1.0 - (1.0 - t) ** 3  # ease-out cubic
+            s = 1.0 - (1.0 - t) ** 3  # ease-out cubic for zoom-in
 
-        if eased is not None and eased > 0.0:
-            inset_w = max(160, w // 4)
+        if s is not None:
+            final_w = max(160, w // 4)
             ih, iw = self.frozen_frame.shape[:2]
-            inset_h = max(1, int(round(inset_w * ih / iw)))
-            inset = cv2.resize(self.frozen_frame, (inset_w, inset_h), interpolation=cv2.INTER_AREA)
-            final_x = w - inset_w - margin
+            final_h = max(1, int(round(final_w * ih / iw)))
+            final_x = w - final_w - margin
             final_y = banner_h + margin
-            start_x = w + 4  # just off-screen right
-            x0 = int(round(start_x + (final_x - start_x) * eased))
-            y0 = final_y
-            alpha = eased
 
-            x_clip0, x_clip1 = max(0, x0), min(w, x0 + inset_w)
-            y_clip0, y_clip1 = max(0, y0), min(h, y0 + inset_h)
+            # Lerp the rect between full-frame (0, 0, w, h) and the final PiP rect.
+            cur_w = max(1, int(round(w + (final_w - w) * s)))
+            cur_h = max(1, int(round(h + (final_h - h) * s)))
+            cur_x = int(round(final_x * s))
+            cur_y = int(round(final_y * s))
+
+            # Alpha: zoom-in stays opaque; zoom-out fades as it grows.
+            alpha = s if is_exiting else 1.0
+
+            inset = cv2.resize(self.frozen_frame, (cur_w, cur_h), interpolation=cv2.INTER_AREA)
+            x_clip0, x_clip1 = max(0, cur_x), min(w, cur_x + cur_w)
+            y_clip0, y_clip1 = max(0, cur_y), min(h, cur_y + cur_h)
             if x_clip1 > x_clip0 and y_clip1 > y_clip0:
-                src_x0 = x_clip0 - x0
+                src_x0 = x_clip0 - cur_x
                 src_x1 = src_x0 + (x_clip1 - x_clip0)
-                src_y0 = y_clip0 - y0
+                src_y0 = y_clip0 - cur_y
                 src_y1 = src_y0 + (y_clip1 - y_clip0)
                 inset_clip = inset[src_y0:src_y1, src_x0:src_x1]
                 roi = out[y_clip0:y_clip1, x_clip0:x_clip1]
@@ -200,17 +395,21 @@ class VLMChatApp:
                     roi[...] = inset_clip
                 else:
                     cv2.addWeighted(inset_clip, alpha, roi, 1.0 - alpha, 0.0, dst=roi)
-                border_intensity = int(255 * alpha)
-                cv2.rectangle(out,
-                              (x0 - 1, y0 - 1),
-                              (x0 + inset_w, y0 + inset_h),
-                              (border_intensity, border_intensity, border_intensity), 1)
+                # Border only once the inset is small enough to read as a thumbnail.
+                if s > 0.6:
+                    border_intensity = int(255 * alpha)
+                    cv2.rectangle(out,
+                                  (cur_x - 1, cur_y - 1),
+                                  (cur_x + cur_w, cur_y + cur_h),
+                                  (border_intensity, border_intensity, border_intensity), 1)
 
         # Bottom panel: question / response.
         panel_lines = []
         max_text_w = w - 2 * margin
         if self.current_state == STATE_CAPTURED:
-            panel_lines = self._wrap_text("Q: " + self.user_question + "_",
+            # Suppress the typing caret while recording / transcribing.
+            caret = "" if (self.is_recording or self.is_transcribing) else "_"
+            panel_lines = self._wrap_text("Q: " + self.user_question + caret,
                                           max_text_w, font, scale, thickness)
         elif self.current_state in (STATE_PROCESSING, STATE_RESULT):
             q_lines = self._wrap_text("Q: " + self.user_question,
@@ -237,6 +436,8 @@ class VLMChatApp:
         """Start the PiP slide-out animation; cleanup happens once it finishes."""
         if self.frozen_frame is not None and self.pip_anim_out_start is None:
             self.pip_anim_out_start = time.time()
+        # Stop any in-flight TTS playback so it doesn't keep talking after we move on.
+        self._tts_interrupt()
 
     def _clear_pip(self) -> None:
         """Hard-reset all PiP / per-question state. Called after slide-out completes."""
@@ -259,19 +460,24 @@ class VLMChatApp:
                 from picamera2 import Picamera2
                 from libcamera import controls
                 picam2 = Picamera2()
-                # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference
+                # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference.
+                # Raw stream is half the sensor's pixel array (binned mode) — sensor-agnostic.
+                raw_size = tuple([v // 2 for v in picam2.camera_properties['PixelArraySize']])
                 config = picam2.create_preview_configuration(
                     main={"size": (1920, 1080), "format": "RGB888"},
                     lores={"size": (448, 448), "format": "RGB888"},
-                    raw={"size": (2304, 1296)},
+                    raw={"size": raw_size},
                 )
                 picam2.configure(config)
                 picam2.start()
-                # Enable continuous autofocus (no-op on fixed-focus sensors).
-                try:
-                    picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
-                except Exception as e:
-                    logger.debug(f"Continuous autofocus not available: {e}")
+                # Enable continuous autofocus only if the sensor supports it.
+                if 'AfMode' in picam2.camera_controls:
+                    try:
+                        picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+                    except Exception as e:
+                        logger.debug(f"Failed to set continuous autofocus: {e}")
+                else:
+                    logger.debug("Sensor does not expose AfMode; skipping autofocus setup.")
 
                 def get_frame():
                     arrays = picam2.capture_arrays(["main", "lores"])[0]
@@ -328,6 +534,9 @@ class VLMChatApp:
             self.running = False
             return
 
+        # Best-effort init of speech I/O. Failures degrade gracefully.
+        self._init_voice_stack()
+
         vlm_future = None
         viewfinder_frame = None
         inference_frame = None
@@ -345,9 +554,15 @@ class VLMChatApp:
                 inference_frame = raw_inf
                 base_frame = viewfinder_frame
 
-                # Drain any pending streamed tokens before drawing.
+                # If a transcription was running, see if it's ready.
+                self._poll_transcription()
+
+                # Drain any pending streamed tokens before drawing, and feed them to TTS.
                 if self.current_state == STATE_PROCESSING and self.backend is not None:
-                    self.streamed_response += self.backend.poll_stream()
+                    new_tokens = self.backend.poll_stream()
+                    if new_tokens:
+                        self.streamed_response += new_tokens
+                        self._tts_feed(new_tokens)
 
                 if base_frame is not None:
                     cv2.imshow('Video', self._draw_overlay(base_frame))
@@ -368,7 +583,10 @@ class VLMChatApp:
                 # Inference completion check.
                 if self.current_state == STATE_PROCESSING and vlm_future is not None and vlm_future.done():
                     if self.backend is not None:
-                        self.streamed_response += self.backend.poll_stream()
+                        tail_tokens = self.backend.poll_stream()
+                        if tail_tokens:
+                            self.streamed_response += tail_tokens
+                            self._tts_feed(tail_tokens)
                     try:
                         result = vlm_future.result()
                         # Prefer the canonical answer (handles error/timeout strings too).
@@ -378,6 +596,8 @@ class VLMChatApp:
                     except Exception as e:
                         logger.error(f"Error getting future result: {e}")
                         self.streamed_response = f"Error processing request: {e}"
+                    # Flush whatever's left in the TTS buffer so the tail sentence isn't dropped.
+                    self._tts_flush()
                     vlm_future = None
                     self.current_state = STATE_RESULT
 
@@ -418,17 +638,44 @@ class VLMChatApp:
                     self.frozen_inference_frame = inference_frame.copy()
                     self.user_question = ''
                     self.streamed_response = ''
+                    self.has_typed = False
                     self.pip_anim_start = time.time()
                     self.pip_anim_out_start = None  # cancel any in-progress slide-out
                     self.current_state = STATE_CAPTURED
             return
 
         if self.current_state == STATE_CAPTURED:
+            SPACE = 32
+
+            # Space toggles recording, but only when the user hasn't started typing —
+            # once they've typed anything, Space is treated as a regular character.
+            if (key == SPACE and self.speech_enabled
+                    and self.audio_recorder is not None
+                    and not self.is_transcribing
+                    and not self.has_typed):
+                if self.is_recording:
+                    self._stop_recording_and_transcribe()
+                else:
+                    self._start_recording()
+                return
+
+            # While recording or transcribing, only Esc / Enter affect the app — block edits.
+            if self.is_recording or self.is_transcribing:
+                if key == ESC:
+                    self._abort_recording()
+                    self.is_transcribing = False
+                    self.transcribe_future = None
+                    self._dismiss_pip()
+                    self.current_state = STATE_STREAMING
+                return
+
             if key == ESC:
+                self._abort_recording()
                 self._dismiss_pip()
                 self.current_state = STATE_STREAMING
                 return
             if key in ENTER:
+                self._abort_recording()
                 if not self.user_question:
                     self.user_question = "Describe the image"
                 if SAVE_FRAMES and self.frozen_inference_frame is not None:
@@ -437,13 +684,16 @@ class VLMChatApp:
                 if self.backend is not None:
                     self.backend.clear_stream()
                 self.streamed_response = ''
+                self._tts_begin()
                 self.current_state = STATE_PROCESSING
                 return
             if key in BACKSPACE:
                 self.user_question = self.user_question[:-1]
+                self.has_typed = True
                 return
             if 32 <= key <= 126:
                 self.user_question += chr(key)
+                self.has_typed = True
             return
 
         if self.current_state == STATE_PROCESSING:
@@ -469,6 +719,10 @@ class VLMChatApp:
 
 if __name__ == "__main__":
     parser = get_standalone_parser()
+    parser.add_argument('--no-stt', action='store_true',
+                        help='Disable speech-to-text (Whisper) input. Type the question instead.')
+    parser.add_argument('--no-tts', action='store_true',
+                        help='Disable text-to-speech (Piper) output of the response.')
 
     # Handle --list-models flag before full initialization
     handle_list_models_flag(parser, VLM_CHAT_APP)
@@ -505,6 +759,11 @@ if __name__ == "__main__":
         print('Please provide an input source using the "--input" argument: "usb" for USB camera or "rpi" for Raspberry Pi camera.')
         sys.exit(1)
 
-    app = VLMChatApp(camera=video_source, camera_type=source_type)
+    app = VLMChatApp(
+        camera=video_source,
+        camera_type=source_type,
+        speech_enabled=not options_menu.no_stt,
+        tts_enabled=not options_menu.no_tts,
+    )
     app.run()
     sys.exit(0)
