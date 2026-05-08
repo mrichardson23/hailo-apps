@@ -4,9 +4,7 @@ import os
 import cv2
 import sys
 import concurrent.futures
-import select
 import time
-import platform
 from typing import Optional, Callable, Any
 from pathlib import Path
 
@@ -72,6 +70,7 @@ class VLMChatApp:
         self.frozen_inference_frame = None
         self.current_state = STATE_STREAMING
         self.user_question = ''
+        self.streamed_response = ''
         self.backend: Optional[Backend] = None
         self.video_thread: Optional[threading.Thread] = None
 
@@ -88,44 +87,110 @@ class VLMChatApp:
             self.backend.close()
         self.executor.shutdown(wait=True)
 
-    def _get_user_input(self) -> Optional[str]:
-        """
-        Read user input from stdin without blocking.
+    @staticmethod
+    def _draw_translucent_box(frame, x: int, y: int, w: int, h: int, alpha: float = 0.55) -> None:
+        """Darken a region of `frame` in-place, simulating a translucent black box."""
+        h_f, w_f = frame.shape[:2]
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(w_f, x + w), min(h_f, y + h)
+        if x1 <= x0 or y1 <= y0:
+            return
+        roi = frame[y0:y1, x0:x1]
+        cv2.addWeighted(roi, 1.0 - alpha, roi, 0.0, 0.0, dst=roi)
 
-        Platform behavior:
-            - Linux / POSIX systems: use `select` to check if stdin is ready.
-            - Windows: use `msvcrt.kbhit()` to detect keyboard input.
+    @staticmethod
+    def _wrap_text(text: str, max_width_px: int, font: int, scale: float, thickness: int) -> list:
+        """Greedy word-wrap; falls back to per-character break for over-long tokens."""
+        if not text:
+            return ['']
+        lines = []
+        for paragraph in text.split('\n'):
+            current = ''
+            for word in paragraph.split(' '):
+                candidate = word if not current else current + ' ' + word
+                (cw, _), _ = cv2.getTextSize(candidate, font, scale, thickness)
+                if cw <= max_width_px:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                    current = ''
+                # Word alone doesn't fit — break by character.
+                buf = ''
+                for ch in word:
+                    nxt = buf + ch
+                    (bw, _), _ = cv2.getTextSize(nxt, font, scale, thickness)
+                    if bw <= max_width_px:
+                        buf = nxt
+                    else:
+                        if buf:
+                            lines.append(buf)
+                        buf = ch
+                current = buf
+            lines.append(current)
+        return lines
 
-        Returns:
-            Optional[str]: The user input string if available, otherwise None.
-        """
-        try:
-            system = platform.system()
+    def _draw_overlay(self, frame):
+        """Compose the state-specific overlay on a copy of `frame` and return it."""
+        out = frame.copy()
+        h, w = out.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.5, w / 1400.0)  # ≈0.7 at 960 wide; scales sensibly elsewhere.
+        thickness = 1
+        text_color = (255, 255, 255)
+        margin = max(8, w // 80)
+        line_h = int(28 * scale) + 6
 
-            # Windows handling
-            if system == "Windows":
-                import msvcrt
+        # Top banner: state header.
+        if self.current_state == STATE_STREAMING:
+            header = "LIVE  |  Enter: capture   Q/Esc: quit"
+        elif self.current_state == STATE_CAPTURED:
+            header = "Type question  |  Enter: send   Esc: cancel"
+        elif self.current_state == STATE_PROCESSING:
+            header = "Processing..."
+        elif self.current_state == STATE_RESULT:
+            header = "Enter: continue   Q/Esc: quit"
+        else:
+            header = ""
 
-                # kbhit() checks if a key was pressed without blocking
-                if msvcrt.kbhit():
-                    # Read the full line once the user presses Enter
-                    return sys.stdin.readline().strip()
+        banner_h = line_h + 2 * margin
+        self._draw_translucent_box(out, 0, 0, w, banner_h, alpha=0.55)
+        cv2.putText(out, header, (margin, margin + line_h - 6),
+                    font, scale, text_color, thickness, cv2.LINE_AA)
 
-                return None
+        # Bottom panel: question / response.
+        panel_lines = []
+        max_text_w = w - 2 * margin
+        if self.current_state == STATE_CAPTURED:
+            panel_lines = self._wrap_text("Q: " + self.user_question + "_",
+                                          max_text_w, font, scale, thickness)
+        elif self.current_state in (STATE_PROCESSING, STATE_RESULT):
+            q_lines = self._wrap_text("Q: " + self.user_question,
+                                      max_text_w, font, scale, thickness)
+            response_text = self.streamed_response.strip()
+            r_lines = self._wrap_text(response_text, max_text_w, font, scale, thickness) if response_text else []
+            panel_lines = q_lines + ([''] + r_lines if r_lines else [])
 
-            # Linux / POSIX systems (Linux, Raspberry Pi, etc.)
-            # select() checks whether stdin has data available to read
-            if select.select([sys.stdin], [], [], 0)[0]:
-                return sys.stdin.readline().strip()
+        if panel_lines:
+            max_panel_lines = max(1, int(h * 0.45) // line_h)
+            if len(panel_lines) > max_panel_lines:
+                panel_lines = panel_lines[-max_panel_lines:]
+            panel_h = len(panel_lines) * line_h + 2 * margin
+            panel_y = h - panel_h
+            self._draw_translucent_box(out, 0, panel_y, w, panel_h, alpha=0.55)
+            for i, line in enumerate(panel_lines):
+                y = panel_y + margin + (i + 1) * line_h - 6
+                cv2.putText(out, line, (margin, y),
+                            font, scale, text_color, thickness, cv2.LINE_AA)
 
-            # No input available
-            return None
+        return out
 
-        except Exception as e:
-            # Do not interrupt the application if input polling fails
-            logger.debug(f"Non-blocking input failed: {e}")
-            return None
-
+    def _reset_session(self) -> None:
+        """Clear all per-question state."""
+        self.frozen_frame = None
+        self.frozen_inference_frame = None
+        self.user_question = ''
+        self.streamed_response = ''
 
     def _init_camera(self) -> tuple[Callable[[], Any], Callable[[], None], str]:
         """
@@ -140,8 +205,8 @@ class VLMChatApp:
                 picam2 = Picamera2()
                 # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference
                 config = picam2.create_preview_configuration(
-                    main={"size": (960, 720),"format": "BGR888"},
-                    lores={"size": (640, 480), "format": "BGR888"},
+                    main={"size": (960, 720), "format": "RGB888"},
+                    lores={"size": (640, 480), "format": "RGB888"},
                 )
                 picam2.configure(config)
                 picam2.start()
@@ -173,25 +238,8 @@ class VLMChatApp:
             camera_name = "USB"
             return get_frame, cleanup, camera_name
 
-    def _print_state_prompt(self):
-        """Print prompt based on current state."""
-        print("\n" + "="*80)
-        if self.current_state == STATE_STREAMING:
-            print("  🎥  LIVE VIDEO  |  Press Enter to CAPTURE image ('q' to quit)")
-            print("="*80)
-        elif self.current_state == STATE_CAPTURED:
-            print("  📷  IMAGE CAPTURED  |  Type question (Enter='Describe the image', 'q' to Cancel)")
-            print("="*80)
-            print("Question: ", end="", flush=True)
-        elif self.current_state == STATE_PROCESSING:
-            print("  ⏳  PROCESSING...  |  Please wait")
-            print("="*80)
-        elif self.current_state == STATE_RESULT:
-            print("  ✅  RESULT READY  |  Press Enter to continue")
-            print("="*80)
-
     def show_video(self):
-        """Main loop for displaying video and handling user interaction."""
+        """Main loop: render video + overlay and handle keystrokes from the cv2 window."""
         try:
             get_frame, cleanup, _ = self._init_camera()
         except Exception:
@@ -204,7 +252,6 @@ class VLMChatApp:
 
         # Initialize Backend
         try:
-            # Use globally resolved hef_path
             self.backend = Backend(
                 hef_path=str(hef_path),
                 max_tokens=MAX_TOKENS,
@@ -219,118 +266,128 @@ class VLMChatApp:
             return
 
         vlm_future = None
-
-        # Initial Prompt
-        self._print_state_prompt()
-
-        # Ensure frames are defined in outer scope for safety
         viewfinder_frame = None
         inference_frame = None
 
         try:
             while self.running:
-                # Display Logic
+                # Acquire / pick the base frame for this iteration.
                 if self.current_state == STATE_STREAMING:
                     raw_view, raw_inf = get_frame()
                     if raw_view is None:
                         logger.error("Failed to read frame from camera")
                         break
+                    # picamera2 'RGB888' yields BGR-ordered bytes in numpy (matching cv2). USB is BGR. No conversion needed.
+                    viewfinder_frame = raw_view
+                    inference_frame = raw_inf
+                    base_frame = viewfinder_frame
+                else:
+                    base_frame = self.frozen_frame
 
-                    # Viewfinder: show the larger 1280x1280 stream (RPI) or the
-                    # single USB frame. picamera2 returns RGB; convert to BGR for cv2.
-                    if self.camera_type == RPI_NAME_I:
-                        viewfinder_frame = cv2.cvtColor(raw_view, cv2.COLOR_RGB2BGR)
-                        inference_frame = cv2.cvtColor(raw_inf, cv2.COLOR_RGB2BGR)
-                    else:
-                        viewfinder_frame = raw_view
-                        inference_frame = raw_inf
+                # Drain any pending streamed tokens before drawing.
+                if self.current_state == STATE_PROCESSING and self.backend is not None:
+                    self.streamed_response += self.backend.poll_stream()
 
-                    cv2.imshow('Video', viewfinder_frame)
-                elif self.current_state in [STATE_CAPTURED, STATE_PROCESSING, STATE_RESULT]:
-                    if self.frozen_frame is not None:
-                        cv2.imshow('Video', self.frozen_frame)
+                if base_frame is not None:
+                    cv2.imshow('Video', self._draw_overlay(base_frame))
 
-                # Key Handling (Window)
-                key = cv2.waitKey(25) & 0xFF
-                if key == ord('q'):
-                    self.stop()
+                # Single source of input: the cv2 window.
+                key = cv2.waitKey(25)
+                key = -1 if key == -1 else key & 0xFFFF
+                self._handle_key(key, viewfinder_frame, inference_frame)
+
+                if not self.running:
                     break
 
-                # Input Handling (Terminal)
-                user_input = self._get_user_input()
+                # Inference completion check.
+                if self.current_state == STATE_PROCESSING and vlm_future is not None and vlm_future.done():
+                    if self.backend is not None:
+                        self.streamed_response += self.backend.poll_stream()
+                    try:
+                        result = vlm_future.result()
+                        # Prefer the canonical answer (handles error/timeout strings too).
+                        answer = result.get('answer') if isinstance(result, dict) else None
+                        if answer:
+                            self.streamed_response = answer
+                    except Exception as e:
+                        logger.error(f"Error getting future result: {e}")
+                        self.streamed_response = f"Error processing request: {e}"
+                    vlm_future = None
+                    self.current_state = STATE_RESULT
 
-                # State Machine Logic
-                if self.current_state == STATE_STREAMING:
-                    if user_input is not None: # User pressed Enter (or typed something)
-                        stripped = user_input.strip()
-                        if stripped.lower() in ['q', 'quit']:
-                            self.stop()
-                            break
-
-                        # Capture current frames: viewfinder for display, inference frame for the model
-                        if viewfinder_frame is not None and inference_frame is not None:
-                            self.frozen_frame = viewfinder_frame.copy()
-                            self.frozen_inference_frame = inference_frame.copy()
-                            self.current_state = STATE_CAPTURED
-                            self._print_state_prompt()
-
-                elif self.current_state == STATE_CAPTURED:
-                    if user_input is not None:
-                        stripped = user_input.strip()
-                        if stripped.lower() in ['q', 'quit']:
-                            self.current_state = STATE_STREAMING
-                            self.frozen_frame = None
-                            self.frozen_inference_frame = None
-                            self._print_state_prompt()
-                            continue
-
-                        self.user_question = stripped or "Describe the image"
-                        if not stripped:
-                            print(f"Using default prompt: '{self.user_question}'")
-
-                        if SAVE_FRAMES and self.frozen_inference_frame is not None:
-                            timestamp = time.strftime("%Y%m%d-%H%M%S")
-                            cv2.imwrite(f"frame_{timestamp}.jpg", self.frozen_inference_frame)
-                            print(f"Frame saved as frame_{timestamp}.jpg")
-
-                        self.current_state = STATE_PROCESSING
-                        self._print_state_prompt()
-
-                        vlm_future = self.executor.submit(
-                            self.backend.vlm_inference,
-                            self.frozen_inference_frame.copy(),
-                            self.user_question,
-                            INFERENCE_TIMEOUT
-                        )
-
-                elif self.current_state == STATE_PROCESSING:
-                    if vlm_future and vlm_future.done():
-                        try:
-                            # We get the result but we don't print the full answer again
-                            # because it was streamed by the worker process.
-                            # We only handle errors or unexpected cases here.
-                            # You can get the full answer by calling result.get('answer')
-                            # print(f"\n\nAnswer: {result.get('answer')}")
-                            result = vlm_future.result()
-                        except Exception as e:
-                            logger.error(f"Error getting future result: {e}")
-                            print(f"\nError processing request: {e}")
-
-                        vlm_future = None
-                        self.current_state = STATE_RESULT
-                        self._print_state_prompt()
-
-                elif self.current_state == STATE_RESULT:
-                    if user_input is not None: # User pressed Enter
-                        self.current_state = STATE_STREAMING
-                        self.frozen_frame = None
-                        self.frozen_inference_frame = None
-                        self._print_state_prompt()
+                # Schedule the inference future once we've fully entered PROCESSING.
+                if (self.current_state == STATE_PROCESSING
+                        and vlm_future is None
+                        and self.frozen_inference_frame is not None
+                        and self.user_question
+                        and self.backend is not None):
+                    vlm_future = self.executor.submit(
+                        self.backend.vlm_inference,
+                        self.frozen_inference_frame.copy(),
+                        self.user_question,
+                        INFERENCE_TIMEOUT
+                    )
 
         finally:
             cleanup()
             cv2.destroyAllWindows()
             self.stop()
+
+    def _handle_key(self, key: int, viewfinder_frame, inference_frame) -> None:
+        """Dispatch a key press according to the current state."""
+        if key == -1:
+            return
+
+        ENTER = (10, 13)
+        BACKSPACE = (8, 127)
+        ESC = 27
+
+        if self.current_state == STATE_STREAMING:
+            if key == ESC or key in (ord('q'), ord('Q')):
+                self.stop()
+                return
+            if key in ENTER:
+                if viewfinder_frame is not None and inference_frame is not None:
+                    self.frozen_frame = viewfinder_frame.copy()
+                    self.frozen_inference_frame = inference_frame.copy()
+                    self.user_question = ''
+                    self.streamed_response = ''
+                    self.current_state = STATE_CAPTURED
+            return
+
+        if self.current_state == STATE_CAPTURED:
+            if key == ESC:
+                self._reset_session()
+                self.current_state = STATE_STREAMING
+                return
+            if key in ENTER:
+                if not self.user_question:
+                    self.user_question = "Describe the image"
+                if SAVE_FRAMES and self.frozen_inference_frame is not None:
+                    timestamp = time.strftime("%Y%m%d-%H%M%S")
+                    cv2.imwrite(f"frame_{timestamp}.jpg", self.frozen_inference_frame)
+                if self.backend is not None:
+                    self.backend.clear_stream()
+                self.streamed_response = ''
+                self.current_state = STATE_PROCESSING
+                return
+            if key in BACKSPACE:
+                self.user_question = self.user_question[:-1]
+                return
+            if 32 <= key <= 126:
+                self.user_question += chr(key)
+            return
+
+        if self.current_state == STATE_PROCESSING:
+            return  # Inputs ignored while inference is running.
+
+        if self.current_state == STATE_RESULT:
+            if key == ESC or key in (ord('q'), ord('Q')):
+                self.stop()
+                return
+            if key in ENTER:
+                self._reset_session()
+                self.current_state = STATE_STREAMING
 
     def run(self):
         """Start the application thread."""

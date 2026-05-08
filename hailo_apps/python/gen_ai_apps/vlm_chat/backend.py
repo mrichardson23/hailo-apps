@@ -10,14 +10,15 @@ from hailo_apps.python.core.common.core import get_logger
 # Initialize logger
 logger = get_logger(__name__)
 
-def vlm_worker_process(request_queue: mp.Queue, response_queue: mp.Queue, hef_path: str,
-                      max_tokens: int, temperature: float, seed: int) -> None:
+def vlm_worker_process(request_queue: mp.Queue, response_queue: mp.Queue, stream_queue: mp.Queue,
+                      hef_path: str, max_tokens: int, temperature: float, seed: int) -> None:
     """
     Worker process for VLM inference.
 
     Args:
         request_queue (mp.Queue): Queue to receive inference requests.
         response_queue (mp.Queue): Queue to send inference results.
+        stream_queue (mp.Queue): Queue used to push generated token chunks for live UI display.
         hef_path (str): Path to the HEF model file.
         max_tokens (int): Maximum number of tokens to generate.
         temperature (float): Sampling temperature.
@@ -41,7 +42,8 @@ def vlm_worker_process(request_queue: mp.Queue, response_queue: mp.Queue, hef_pa
                     vlm,
                     max_tokens,
                     temperature,
-                    seed
+                    seed,
+                    stream_queue
                 )
                 response_queue.put({'result': result, 'error': None})
             except Exception as e:
@@ -59,7 +61,8 @@ def vlm_worker_process(request_queue: mp.Queue, response_queue: mp.Queue, hef_pa
             logger.debug(f"Error releasing resources: {e}")
 
 def _hailo_inference_inner(image: np.ndarray, prompts: dict, vlm: VLM,
-                          max_tokens: int, temperature: float, seed: int) -> dict:
+                          max_tokens: int, temperature: float, seed: int,
+                          stream_queue: mp.Queue) -> dict:
     """
     Inner inference function executed inside the worker process.
 
@@ -70,6 +73,7 @@ def _hailo_inference_inner(image: np.ndarray, prompts: dict, vlm: VLM,
         max_tokens (int): Maximum tokens to generate.
         temperature (float): Sampling temperature.
         seed (int): Random seed.
+        stream_queue (mp.Queue): Queue to push token chunks for live display.
 
     Returns:
         dict: Dictionary containing the answer and inference time.
@@ -94,7 +98,7 @@ def _hailo_inference_inner(image: np.ndarray, prompts: dict, vlm: VLM,
         with vlm.generate(prompt=prompt, frames=[image], temperature=temperature, seed=seed, max_generated_tokens=max_tokens) as generation:
             for chunk in generation:
                 if chunk != '<|im_end|>':
-                    print(chunk, end='', flush=True)  # Keep print for real-time feedback in console
+                    stream_queue.put(chunk)
                     response += chunk
 
         vlm.clear_context()
@@ -135,12 +139,32 @@ class Backend:
 
         self._request_queue = mp.Queue(maxsize=10)  # Limit queue size
         self._response_queue = mp.Queue(maxsize=10)
+        self._stream_queue: mp.Queue = mp.Queue()
         self._process = mp.Process(
             target=vlm_worker_process,
-            args=(self._request_queue, self._response_queue, self.hef_path, self.max_tokens, self.temperature, self.seed)
+            args=(self._request_queue, self._response_queue, self._stream_queue,
+                  self.hef_path, self.max_tokens, self.temperature, self.seed)
         )
         self._process.start()
         logger.info("VLM backend process started.")
+
+    def poll_stream(self) -> str:
+        """Drain any pending generated token chunks. Returns the concatenated text."""
+        chunks = []
+        try:
+            while True:
+                chunks.append(self._stream_queue.get_nowait())
+        except Exception:
+            pass
+        return ''.join(chunks)
+
+    def clear_stream(self) -> None:
+        """Discard any leftover token chunks from a previous request."""
+        try:
+            while True:
+                self._stream_queue.get_nowait()
+        except Exception:
+            pass
 
     def vlm_inference(self, image: np.ndarray, prompt: str, timeout: int = 30) -> dict:
         """
