@@ -699,7 +699,7 @@ class VLMChatApp:
         """
         try:
             from picamera2 import Picamera2
-            from libcamera import controls
+            from libcamera import controls, Transform
             picam2 = Picamera2()
             # Dual stream: large 'main' for viewfinder, smaller 'lores' for inference.
             # Raw stream is half the sensor's pixel array (binned mode) — sensor-agnostic.
@@ -712,6 +712,7 @@ class VLMChatApp:
                 main={"size": (1920, 1080), "format": "RGB888"},
                 lores={"size": (336, 336), "format": "RGB888", "preserve_ar": True},
                 raw={"size": raw_size},
+                transform=Transform(hflip=1),
             )
             picam2.configure(config)
             picam2.start()
