@@ -245,6 +245,12 @@ class Backend:
         h, w = image_array.shape[:2]
         target_w, target_h = target_size
 
+        # Fast path: input already matches target — skip resize + crop
+        # entirely. Picamera2's lores stream is configured at 336x336 so
+        # this hits on every monitor and Q&A call.
+        if w == target_w and h == target_h:
+            return image_array if image_array.dtype == np.uint8 else image_array.astype(np.uint8)
+
         # Scale to cover the target size (Central Crop strategy)
         scale = max(target_w / w, target_h / h)
         new_w = int(w * scale)

@@ -51,7 +51,7 @@ MONITOR_COOLDOWN_DEFAULT = 10.0  # min seconds between fired events
 
 # Strength multiplier for the --blur-fov side-strip blur. 1.0 is the auto-
 # derived default; 2.0 is twice as blurry, 0.5 half.
-BLUR_STRENGTH = 0.3
+BLUR_STRENGTH = 0.4
 
 # Initialize logger
 logger = get_logger(__name__)
