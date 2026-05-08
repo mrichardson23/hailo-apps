@@ -80,6 +80,7 @@ class VLMChatApp:
         self.pip_anim_out_start: Optional[float] = None  # set when dismissing, drives slide-out
         self.backend: Optional[Backend] = None
         self.video_thread: Optional[threading.Thread] = None
+        self.vlm_future: Optional[concurrent.futures.Future] = None
 
         # Speech / TTS feature state — voice components are initialised lazily in show_video.
         self.speech_enabled = speech_enabled
@@ -364,6 +365,53 @@ class VLMChatApp:
             self.monitor_future.cancel()
             self.monitor_future = None
 
+    def _reset_backend(self) -> None:
+        """Tear down the VLM backend and start a fresh one — equivalent to
+        clearing context and reloading the HEF. Useful when the model gets
+        wedged. Returns the user to STATE_STREAMING."""
+        self._show_splash("Reloading VLM...")
+        # Drop in-flight futures from the old backend.
+        self._cancel_monitor_future()
+        if self.vlm_future is not None:
+            self.vlm_future.cancel()
+            self.vlm_future = None
+        # Stop any TTS read-back and reset its buffer.
+        self._tts_interrupt()
+        # Close the old backend (kills the worker process, releases the device).
+        if self.backend is not None:
+            try:
+                self.backend.close()
+            except Exception as e:
+                logger.debug(f"Error closing backend during reset: {e}")
+            self.backend = None
+        # Spin up a new backend with the same config. The HEF reloads here.
+        try:
+            self.backend = Backend(
+                hef_path=str(hef_path),
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE,
+                seed=SEED,
+                system_prompt=SYSTEM_PROMPT,
+            )
+            logger.info("VLM backend reloaded.")
+        except Exception as e:
+            logger.error(f"Failed to reload VLM backend: {e}")
+            self.running = False
+            return
+        # Reset the per-question / per-event state so we land cleanly in STREAMING.
+        self._dismiss_pip()
+        self.user_question = ''
+        self.streamed_response = ''
+        self.has_typed = False
+        self.is_recording = False
+        self.is_transcribing = False
+        self.transcribe_future = None
+        self.trigger_text = ''
+        self.last_event_text = ''
+        self.last_capture_time = 0.0
+        self.last_event_time = 0.0
+        self.current_state = STATE_STREAMING
+
     @staticmethod
     def _draw_translucent_box(frame, x: int, y: int, w: int, h: int,
                               alpha: float = 0.55, tint=None) -> None:
@@ -434,7 +482,7 @@ class VLMChatApp:
 
         # Top banner: state header.
         if self.current_state == STATE_STREAMING:
-            header = "LIVE  |  Enter: capture   T: trigger   Q/Esc: quit"
+            header = "LIVE  |  Enter: capture   T: trigger   R: reset   Q/Esc: quit"
         elif self.current_state == STATE_CAPTURED:
             if self.is_recording:
                 header = "Recording...  |  Space: stop"
@@ -652,7 +700,6 @@ class VLMChatApp:
         self._show_splash("Loading speech models...")
         self._init_voice_stack()
 
-        vlm_future = None
         viewfinder_frame = None
         inference_frame = None
 
@@ -696,14 +743,14 @@ class VLMChatApp:
                     break
 
                 # Inference completion check.
-                if self.current_state == STATE_PROCESSING and vlm_future is not None and vlm_future.done():
+                if self.current_state == STATE_PROCESSING and self.vlm_future is not None and self.vlm_future.done():
                     if self.backend is not None:
                         tail_tokens = self.backend.poll_stream()
                         if tail_tokens:
                             self.streamed_response += tail_tokens
                             self._tts_feed(tail_tokens)
                     try:
-                        result = vlm_future.result()
+                        result = self.vlm_future.result()
                         # Prefer the canonical answer (handles error/timeout strings too).
                         answer = result.get('answer') if isinstance(result, dict) else None
                         if answer:
@@ -713,16 +760,16 @@ class VLMChatApp:
                         self.streamed_response = f"Error processing request: {e}"
                     # Flush whatever's left in the TTS buffer so the tail sentence isn't dropped.
                     self._tts_flush()
-                    vlm_future = None
+                    self.vlm_future = None
                     self.current_state = STATE_RESULT
 
                 # Schedule the inference future once we've fully entered PROCESSING.
                 if (self.current_state == STATE_PROCESSING
-                        and vlm_future is None
+                        and self.vlm_future is None
                         and self.frozen_inference_frame is not None
                         and self.user_question
                         and self.backend is not None):
-                    vlm_future = self.executor.submit(
+                    self.vlm_future = self.executor.submit(
                         self.backend.vlm_inference,
                         self.frozen_inference_frame.copy(),
                         self.user_question,
@@ -779,6 +826,14 @@ class VLMChatApp:
         ENTER = (10, 13)
         BACKSPACE = (8, 127)
         ESC = 27
+
+        # 'R' is a global reset — works in any state where 'r' isn't part of
+        # text entry (i.e. not in CAPTURED or TRIGGER_SETUP). Tears down the
+        # VLM backend and reloads the HEF.
+        if (key in (ord('r'), ord('R'))
+                and self.current_state not in (STATE_CAPTURED, STATE_TRIGGER_SETUP)):
+            self._reset_backend()
+            return
 
         if self.current_state == STATE_STREAMING:
             if key == ESC or key in (ord('q'), ord('Q')):
