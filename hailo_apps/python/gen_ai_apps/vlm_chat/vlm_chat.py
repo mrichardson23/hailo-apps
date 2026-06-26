@@ -1172,9 +1172,8 @@ if __name__ == "__main__":
                         help='Min seconds between successive captures in monitor mode (default 1.0).')
     parser.add_argument('--monitor-cooldown', type=float, default=MONITOR_COOLDOWN_DEFAULT,
                         help='Min seconds between fired events in monitor mode (default 10.0).')
-    parser.add_argument('--blur-fov', action='store_true',
-                        help='Blur the left/right strips outside the central square crop, '
-                             'so the live view + PiP show the actual VLM field of view.')
+    parser.add_argument('--no-blur-fov', action='store_false', dest='blur_fov',
+                        help='Do not blur the left/right strips outside the central square crop.')
 
     # Handle --list-models flag before full initialization
     handle_list_models_flag(parser, VLM_CHAT_APP)
